@@ -1,0 +1,12 @@
+  for the landing testing time   03 66 80 80 80 80 02 02 99
+
+  motion sensor     03 66 80 80 80 80 10 10 99
+
+
+  # for the landing "03 66 80 80 80 80 02 02 99"
+                                        # last to stop "03 66 90 74 80 5C 04 3C 99"
+                                        #   for the take off 03 66 80 80 80 80 01 01 99
+                                        # for to on motion sensoor "03 66 80 80 80 80 10 10 99"
+
+
+
