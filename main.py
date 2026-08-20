@@ -20,7 +20,7 @@ CONTROLS (window must be focused - click on it once before flying):
                   (runs on its own thread). A verified alternative exists in
                   code as Drone.land_ramp() (throttle-to-zero, confirmed
                   from your packet capture) if this approach keeps failing.
-    C           - calibrate / recenter
+    C           - toggle camera direction: forward <-> downward
 
     W / S       - forward / backward           (pitch)
     A / D       - roll - tested / opposite pattern
@@ -43,6 +43,11 @@ Protocol basis (from packet captures):
     CMD 0x00 = idle, CMD 0x01 = takeoff, CMD 0x04 = kill.
     Axes range ~0x58 (min) to 0xA8 (max) around center 0x80.
     Landing = throttle ramped to 0x00 (no dedicated land CMD exists).
+
+    Camera direction is a separate, standalone 2-byte datagram (not part of
+    the 03 66 ... 99 flight frame above):
+        06 01 = camera facing forward
+        06 02 = camera facing downward
 """
 
 import socket
@@ -64,7 +69,7 @@ DRONE_IP = "192.168.1.1"
 DRONE_PORT = 7099
 
 RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
-YOLO_MODEL_PATH = "yolov8n.pt"
+YOLO_MODEL_PATH = "software/yolov8n.pt"
 VIDEO_DISPLAY_SIZE = (480, 360)   # width, height shown in the GUI
 VIDEO_REFRESH_MS = 50             # how often the GUI polls for a new frame (~20fps ceiling)
 
@@ -77,10 +82,14 @@ CMD_IDLE = 0x00
 CMD_TAKEOFF = 0x01
 CMD_KILL = 0x04
 
+# Standalone camera-direction datagrams - separate from the flight frame protocol.
+CAMERA_FORWARD_FRAME = bytes.fromhex("0601")
+CAMERA_DOWN_FRAME = bytes.fromhex("0602")
+
 SEND_INTERVAL_MS = 50            # ~20Hz, matches observed traffic rate
 KEY_RELEASE_DEBOUNCE_MS = 60     # swallow OS key-repeat release/press flicker
 
-LAND_FAILSAFE_SECONDS = 3.0
+LAND_FAILSAFE_SECONDS = 10.0
 
 
 def checksum(b2, b3, b4, b5, cmd):
@@ -101,6 +110,7 @@ class Drone:
         self.addr = (ip, port)
         self.throttle = CENTER
         self.armed = False
+        self.camera_facing_down = False   # starts assuming forward-facing
 
     def send_axes(self, b2, b3, b4, b5, cmd=CMD_IDLE):
         self.sock.sendto(build_frame(b2, b3, b4, b5, cmd), self.addr)
@@ -157,6 +167,18 @@ class Drone:
 
     def calibrate(self):
         self._hold_blocking(0.3, cmd=CMD_IDLE)
+
+    def set_camera_direction(self, face_down):
+        """Sends the standalone camera-direction datagram (06 01 / 06 02).
+        This is NOT part of the 03 66 ... 99 flight frame - it's its own
+        2-byte packet, fired once per toggle rather than repeated at 20Hz."""
+        frame = CAMERA_DOWN_FRAME if face_down else CAMERA_FORWARD_FRAME
+        self.sock.sendto(frame, self.addr)
+        self.camera_facing_down = face_down
+
+    def toggle_camera_direction(self):
+        self.set_camera_direction(not self.camera_facing_down)
+        return self.camera_facing_down
 
 
 class VideoStream:
@@ -238,8 +260,8 @@ class DroneApp(tk.Tk):
         self.kill_armed_guard = False       # edge-trigger so combo fires once per hold
         self.quit_armed_guard = False
 
-        # Regular actions (takeoff/land/calibrate) go through this queue and run
-        # one at a time, in order - so pressing L while T is still finishing no
+        # Regular actions (takeoff/land/calibrate/camera toggle) go through this queue
+        # and run one at a time, in order - so pressing L while T is still finishing no
         # longer gets silently dropped, it just runs automatically right after.
         self.action_queue = queue.Queue()
         threading.Thread(target=self._worker_loop, daemon=True).start()
@@ -296,6 +318,10 @@ class DroneApp(tk.Tk):
                                      fg="#888888", wraplength=w - 20, justify="center")
         self.video_label.pack(fill="both", expand=True)
 
+        self.camera_dir_var = tk.StringVar(value="Camera: forward")
+        tk.Label(left, textvariable=self.camera_dir_var, font=mono, fg="#8fd6ff",
+                 bg="#1e1f26").pack(anchor="w", pady=(4, 0))
+
         # ---- right column: existing status / controls / log ----
         right = tk.Frame(body, bg="#1e1f26")
         right.pack(side="left", fill="both", expand=True)
@@ -315,7 +341,7 @@ class DroneApp(tk.Tk):
                  wraplength=420, justify="left").pack(pady=6, anchor="w")
 
         help_text = (
-            "T = takeoff        L = land (EXPERIMENTAL, 10s)   C = calibrate\n"
+            "T = takeoff        L = land (EXPERIMENTAL, 10s)   C = toggle camera dir\n"
             "W/S = forward/back     A/D = roll (tested/opposite)\n"
             "Up/Down = throttle      Left/Right = camera pan\n\n"
             "Hold K + I together = EMERGENCY STOP\n"
@@ -403,7 +429,15 @@ class DroneApp(tk.Tk):
                            lambda: self.drone.land_failsafe(on_progress=self._land_progress),
                            done_msg="Failsafe wait finished - check if it actually landed.")
         elif key == "c":
-            self._enqueue("Calibrating...", self.drone.calibrate, done_msg="Calibrated.")
+            self._enqueue("Toggling camera direction...", self._do_toggle_camera,
+                           done_msg="Camera direction toggled.")
+
+    def _do_toggle_camera(self):
+        """Runs on the worker thread - flips camera_facing_down and fires the
+        single 06 01 / 06 02 datagram, then updates the GUI label."""
+        now_down = self.drone.toggle_camera_direction()
+        label = "downward" if now_down else "forward"
+        self.after(0, lambda: self.camera_dir_var.set(f"Camera: {label}"))
 
     def _handle_combo_keys(self):
         both_ki = "k" in self.pressed and "i" in self.pressed
@@ -430,7 +464,8 @@ class DroneApp(tk.Tk):
 
     def _worker_loop(self):
         """Single background worker - runs queued actions strictly one at a time,
-        so takeoff/land/calibrate frames never get sent on top of each other."""
+        so takeoff/land/calibrate/camera-toggle frames never get sent on top of
+        each other."""
         while True:
             name, fn, done_msg = self.action_queue.get()
             self.busy = True
@@ -449,7 +484,8 @@ class DroneApp(tk.Tk):
 
     def _fire_kill_now(self):
         """Kill bypasses the queue entirely and fires immediately, even if a
-        takeoff/land/calibrate is currently mid-flight - safety comes first."""
+        takeoff/land/calibrate/camera-toggle is currently mid-flight - safety
+        comes first."""
         self._log("> EMERGENCY STOP (K+I)")
         # cancel anything waiting in line so it doesn't run right after the kill
         try:
