@@ -1,53 +1,5 @@
 """
-Drone Control - Tkinter GUI with keyboard flying + live camera/object detection.
-
-Requires:
-    pip install opencv-python ultralytics pillow
-(tkinter itself is standard library - no install needed for the GUI/keyboard part)
-
-The first run will auto-download yolov8n.pt (a few MB) via ultralytics - that
-happens once and can take a moment depending on your connection.
-
-CONTROLS (window must be focused - click on it once before flying):
-    T           - takeoff
-    L           - land: EXPERIMENTAL. Stops sending ANY commands for 10
-                  seconds, hoping the drone's own connection-loss failsafe
-                  lands it automatically (matching what you remember seeing
-                  with the old typed-command script). We tested this at 4s
-                  and it did NOT trigger a landing, so this is now 10s as a
-                  next guess - not yet re-confirmed. During this window you
-                  have ZERO manual control of the drone. K+I still works
-                  (runs on its own thread). A verified alternative exists in
-                  code as Drone.land_ramp() (throttle-to-zero, confirmed
-                  from your packet capture) if this approach keeps failing.
-    C           - toggle camera direction: forward <-> downward
-
-    W / S       - forward / backward           (pitch)
-    A / D       - roll - tested / opposite pattern
-    Up / Down   - throttle up / down            (climb / descend)
-    Left/Right  - camera pan - direction A / B
-
-    K + I  (hold BOTH together)  - EMERGENCY STOP (deliberately a two-key
-                                    combo so you can't kill it by accident)
-    Q + I  (hold BOTH together)  - quit the program (sends kill first)
-
-    Hold any movement key and it keeps sending that direction continuously,
-    at ~20Hz, for as long as it's held - exactly like a real stick. A
-    background heartbeat keeps sending idle/current-position frames even
-    when nothing is pressed, so the drone never loses its connection and
-    auto-lands on you mid-flight.
-
-Protocol basis (from packet captures):
-    03 66 [B2] [B3] [B4] [B5] [CMD] [CHK] 99
-           Roll Pitch Throttle Yaw   Cmd   Checksum = B2^B3^B4^B5^CMD
-    CMD 0x00 = idle, CMD 0x01 = takeoff, CMD 0x04 = kill.
-    Axes range ~0x58 (min) to 0xA8 (max) around center 0x80.
-    Landing = throttle ramped to 0x00 (no dedicated land CMD exists).
-
-    Camera direction is a separate, standalone 2-byte datagram (not part of
-    the 03 66 ... 99 flight frame above):
-        06 01 = camera facing forward
-        06 02 = camera facing downward
+This is the code where we need to add the thing so that the delay oc clicking images and the display we need to compare with the other code
 """
 
 import socket
@@ -56,40 +8,108 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import font as tkfont
+import os
+import datetime
 
 try:
     import cv2
+    import numpy as np
     from ultralytics import YOLO
     from PIL import Image, ImageTk
     VIDEO_AVAILABLE = True
 except ImportError:
-    VIDEO_AVAILABLE = False  # video panel will show an install hint instead of crashing
+    VIDEO_AVAILABLE = False
 
 DRONE_IP = "192.168.1.1"
 DRONE_PORT = 7099
 
 RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
 YOLO_MODEL_PATH = "software/yolov8n.pt"
-VIDEO_DISPLAY_SIZE = (480, 360)   # width, height shown in the GUI
-VIDEO_REFRESH_MS = 50             # how often the GUI polls for a new frame (~20fps ceiling)
+VIDEO_DISPLAY_SIZE = (480, 360)
+VIDEO_REFRESH_MS = 50
+
+# --- Camera tilt correction ---------------------------------------------
+# Your hardware camera sits slightly rotated in its mount, so every frame
+# comes in a few degrees off-level. Rather than touching the hardware, we
+# just rotate each frame back straight before it's shown/detected on.
+# Positive angle = rotate counter-clockwise, negative = clockwise.
+# Start small (5-15 degrees) and adjust until the horizon looks level.
+CAMERA_TILT_ANGLE = 7.5
+
+# --- Fire detection (color/HSV heuristic - no model needed) -------------
+FIRE_LOWER_HSV = (0, 120, 200)
+FIRE_UPPER_HSV = (35, 255, 255)
+FIRE_PIXEL_THRESHOLD = 3000     # tune against your footage
+FIRE_SAVE_COOLDOWN_SECONDS = 5.0
 
 CENTER = 0x80
 MAX_DEV = 0x28
-STICK_MAX = CENTER + MAX_DEV     # 0xA8
-STICK_MIN = CENTER - MAX_DEV     # 0x58
+STICK_MAX = CENTER + MAX_DEV
+STICK_MIN = CENTER - MAX_DEV
 
 CMD_IDLE = 0x00
 CMD_TAKEOFF = 0x01
 CMD_KILL = 0x04
 
-# Standalone camera-direction datagrams - separate from the flight frame protocol.
 CAMERA_FORWARD_FRAME = bytes.fromhex("0601")
 CAMERA_DOWN_FRAME = bytes.fromhex("0602")
 
-SEND_INTERVAL_MS = 50            # ~20Hz, matches observed traffic rate
-KEY_RELEASE_DEBOUNCE_MS = 60     # swallow OS key-repeat release/press flicker
-
+SEND_INTERVAL_MS = 50
+KEY_RELEASE_DEBOUNCE_MS = 60
 LAND_FAILSAFE_SECONDS = 10.0
+
+SAVE_DIR = "output"
+
+#Victim capture & autosave to gallery
+VICTIM_DIR = os.path.join(SAVE_DIR, "victims")
+VICTIM_SAVE_COOLDOWN_SECONDS = 5.0   # min gap between auto-saves, so a person
+                                      # standing in frame doesn't fill the disk
+GALLERY_THUMB_SIZE = (110, 80)       # inline strip thumbnail size
+GALLERY_MAX_STRIP_THUMBS = 5         # how many recent thumbnails show inline
+GALLERY_REFRESH_MS = 2000            # how often the GUI re-checks the folder
+FULL_VIEW_MAX_SIZE = (900, 700)      # cap for the "click to enlarge" popup
+
+# Fire capture autosave, same pattern as the victim folder
+FIRE_DIR = os.path.join(SAVE_DIR, "fire")
+
+
+def fix_tilt(frame, angle=CAMERA_TILT_ANGLE):
+    """Rotates a frame around its center to correct a physically tilted
+    camera mount. Cheap (one warpAffine per frame) and keeps the original
+    frame size, so nothing downstream (YOLO, display resize) needs to change."""
+    if not angle:
+        return frame
+    h, w = frame.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(frame, matrix, (w, h))
+
+
+def detect_fire(frame_bgr):
+    """Heuristic, no-model fire detector: fire pixels tend to sit in a fairly
+    narrow orange/red/yellow + high-brightness band in HSV, so we threshold
+    for that band and count how many pixels match. Returns (is_fire, mask)."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array(FIRE_LOWER_HSV)
+    upper = np.array(FIRE_UPPER_HSV)
+    mask = cv2.inRange(hsv, lower, upper)
+    fire_pixel_count = cv2.countNonZero(mask)
+    is_fire = fire_pixel_count > FIRE_PIXEL_THRESHOLD
+    return is_fire, mask
+
+
+def list_victim_captures(limit=None):
+    """Newest-first list of saved victim capture filepaths. Just reads the
+    folder - safe to call from the GUI thread any time, no locking needed."""
+    try:
+        files = [
+            os.path.join(VICTIM_DIR, f) for f in os.listdir(VICTIM_DIR)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ]
+    except FileNotFoundError:
+        return []
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[:limit] if limit else files
 
 
 def checksum(b2, b3, b4, b5, cmd):
@@ -103,20 +123,17 @@ def build_frame(b2=CENTER, b3=CENTER, b4=CENTER, b5=CENTER, cmd=CMD_IDLE):
 
 
 class Drone:
-    """Thin wrapper around the UDP socket + protocol frame builder."""
-
     def __init__(self, ip=DRONE_IP, port=DRONE_PORT):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addr = (ip, port)
         self.throttle = CENTER
         self.armed = False
-        self.camera_facing_down = False   # starts assuming forward-facing
+        self.camera_facing_down = False
 
     def send_axes(self, b2, b3, b4, b5, cmd=CMD_IDLE):
         self.sock.sendto(build_frame(b2, b3, b4, b5, cmd), self.addr)
 
     def _hold_blocking(self, duration, **axes):
-        """Used only for the short discrete takeoff/kill pulses (runs in a worker thread)."""
         frame = build_frame(**axes)
         end = time.time() + duration
         while time.time() < end:
@@ -133,9 +150,6 @@ class Drone:
         self.armed = False
 
     def land(self, on_progress=None, step=0x10, step_time=0.05):
-        """The packet-capture-verified landing: ramp throttle down to zero.
-        This is the one confirmed by your own capture (throttle dropping
-        smoothly to 0x00 right before your kill command)."""
         b4 = self.throttle
         while b4 > 0:
             b4 = max(0, b4 - step)
@@ -147,15 +161,9 @@ class Drone:
         self.armed = False
 
     def land_ramp(self, on_progress=None, step=0x10, step_time=0.05):
-        """Alias for land() - kept so existing calls using this name still work."""
         return self.land(on_progress=on_progress, step=step, step_time=step_time)
 
     def land_failsafe(self, on_progress=None, duration=LAND_FAILSAFE_SECONDS):
-        """Tested and did NOT work: stopping commands for ~4s did not make
-        the drone land, meaning either this drone has no connection-loss
-        failsafe, or its timeout is much longer than 4s. Left here in case
-        you want to try a longer duration later - not currently wired to
-        any key."""
         start = time.time()
         while time.time() - start < duration:
             remaining = duration - (time.time() - start)
@@ -169,9 +177,6 @@ class Drone:
         self._hold_blocking(0.3, cmd=CMD_IDLE)
 
     def set_camera_direction(self, face_down):
-        """Sends the standalone camera-direction datagram (06 01 / 06 02).
-        This is NOT part of the 03 66 ... 99 flight frame - it's its own
-        2-byte packet, fired once per toggle rather than repeated at 20Hz."""
         frame = CAMERA_DOWN_FRAME if face_down else CAMERA_FORWARD_FRAME
         self.sock.sendto(frame, self.addr)
         self.camera_facing_down = face_down
@@ -182,45 +187,141 @@ class Drone:
 
 
 class VideoStream:
-    """Reads the RTSP camera feed and runs YOLO detection in its own thread.
+    """
+    Delay fix: previously a single loop did capture + YOLO inference back to
+    back. cap.read() on an RTSP stream keeps an internal buffer, and if
+    inference (the slow part) can't keep up with the incoming frame rate,
+    frames pile up in that buffer - so what you SEE on screen is always a
+    few frames (i.e. real seconds) behind live. That backlog only grows over
+    time, it never catches up on its own.
 
-    Deliberately decoupled from Tkinter: this class knows nothing about the
-    GUI. It just keeps `self.latest_frame` updated with the newest annotated
-    frame (as an RGB numpy array), and the GUI polls get_latest() on its own
-    timer. That's what stops slow video/inference from ever freezing the
-    keyboard controls.
+    Fix: split capture and processing into two independent threads.
+      - _capture_loop does nothing but grab frames as fast as the stream
+        provides them and immediately overwrite self._latest_raw. It never
+        waits on YOLO/fire-detection, so OpenCV's internal buffer never
+        has a chance to build up a backlog.
+      - _process_loop always grabs whatever is CURRENTLY in self._latest_raw
+        (never a queue), runs tilt-fix + fire detection + YOLO on it, and
+        publishes the result to self.latest_frame for the GUI to display.
+        If inference is slower than the camera's frame rate, older frames
+        are simply skipped instead of queued - you always see the most
+        recent reality, not a growing backlog of old frames.
     """
 
     def __init__(self, url=RTSP_URL, model_path=YOLO_MODEL_PATH):
         self.url = url
         self.model_path = model_path
         self.cap = None
-        self.latest_frame = None
+        self.latest_frame = None       # annotated RGB frame for display
+        self._latest_raw = None        # newest raw BGR frame from the camera
+        self._raw_frame_id = 0         # bumped every time a new raw frame lands
+        self._last_processed_id = -1
         self.lock = threading.Lock()
+        self.raw_lock = threading.Lock()
         self.running = False
         self.status = "not started"
+        self.recording = False
+        self.video_writer = None
+        self.record_path = None
+        self.last_victim_save_time = 0.0
+        self.last_fire_save_time = 0.0
+        self.fire_active = False
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        os.makedirs(VICTIM_DIR, exist_ok=True)
+        os.makedirs(FIRE_DIR, exist_ok=True)
 
     def start(self):
         self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._process_loop, daemon=True).start()
 
     def stop(self):
         self.running = False
+        self.stop_recording()
 
     def get_latest(self):
         with self.lock:
             return None if self.latest_frame is None else self.latest_frame.copy()
 
-    def _loop(self):
-        self.status = "loading YOLO model..."
-        try:
-            model = YOLO(self.model_path)
-        except Exception as e:
-            self.status = f"model load failed: {e}"
-            return
+    def start_recording(self):
+        with self.lock:
+            self.recording = True
 
+    def stop_recording(self):
+        with self.lock:
+            self.recording = False
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+                self.record_path = None
+
+    def save_snapshot(self):
+        frame = self.get_latest()
+        if frame is None:
+            return None
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(SAVE_DIR, f"snapshot_{ts}.jpg")
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(path, bgr)
+        return path
+
+    def _contains_person(self, results):
+        """True if this YOLO result contains at least one 'person' detection.
+        Wrapped defensively - if the ultralytics output shape ever changes,
+        this just skips auto-save instead of crashing the video thread."""
+        try:
+            boxes = results[0].boxes
+            if boxes is None or boxes.cls is None:
+                return False
+            names = results[0].names
+            for cls_id in boxes.cls.tolist():
+                if names.get(int(cls_id), "").lower() == "person":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _save_victim_capture(self, annotated_bgr):
+        #Saves the annotated frame
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = os.path.join(VICTIM_DIR, f"victim_{ts}.jpg")
+        try:
+            cv2.imwrite(path, annotated_bgr)
+        except Exception:
+            pass
+
+    def _save_fire_capture(self, annotated_bgr):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = os.path.join(FIRE_DIR, f"fire_{ts}.jpg")
+        try:
+            cv2.imwrite(path, annotated_bgr)
+        except Exception:
+            pass
+
+    def _ensure_writer(self, frame_rgb):
+        if self.video_writer is not None:
+            return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_path = os.path.join(SAVE_DIR, f"record_{ts}.avi")
+        h, w = frame_rgb.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        self.video_writer = cv2.VideoWriter(self.record_path, fourcc, 20.0, (w, h))
+
+    def _capture_loop(self):
+        """Only job: keep self._latest_raw as fresh as physically possible.
+        Never touches YOLO/fire-detection, so it can never be slowed down
+        by them - that's what stops the display lag from building up."""
         self.status = "connecting to stream..."
+
+        # CAP_PROP_BUFFERSIZE=1 asks the backend to keep at most one frame
+        # queued internally (support varies by backend, but it's free to try
+        # and helps on backends that honor it).
         self.cap = cv2.VideoCapture(self.url)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
         if not self.cap.isOpened():
             self.status = "stream not available (check RTSP URL / drone connection)"
             return
@@ -231,19 +332,82 @@ class VideoStream:
             if not ret:
                 self.status = "frame lost - stream ended"
                 break
-            try:
-                results = model(frame, verbose=False)
-                annotated = results[0].plot()   # BGR numpy array with boxes drawn
-            except Exception:
-                annotated = frame               # fall back to raw frame if inference errors
-            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            with self.lock:
-                self.latest_frame = annotated_rgb
+            with self.raw_lock:
+                self._latest_raw = frame
+                self._raw_frame_id += 1
 
         if self.cap:
             self.cap.release()
         if self.status == "live":
             self.status = "stopped"
+
+    def _get_latest_raw(self):
+        with self.raw_lock:
+            if self._latest_raw is None or self._raw_frame_id == self._last_processed_id:
+                return None, None
+            return self._latest_raw.copy(), self._raw_frame_id
+
+    def _process_loop(self):
+        self.status = "loading YOLO model..."
+        try:
+            model = YOLO(self.model_path)
+        except Exception as e:
+            self.status = f"model load failed: {e}"
+            return
+
+        # wait for the capture thread to actually start producing frames
+        while self.running and self._latest_raw is None:
+            time.sleep(0.01)
+
+        while self.running:
+            frame, frame_id = self._get_latest_raw()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+            self._last_processed_id = frame_id
+
+            # Correct the physical camera-mount tilt before doing anything
+            # else with this frame (detection + display both benefit).
+            frame = fix_tilt(frame, CAMERA_TILT_ANGLE)
+
+            try:
+                is_fire, _fire_mask = detect_fire(frame)
+            except Exception:
+                is_fire = False
+            self.fire_active = is_fire
+
+            try:
+                results = model(frame, verbose=False)
+                annotated = results[0].plot()
+                if self._contains_person(results):
+                    now = time.time()
+                    if now - self.last_victim_save_time >= VICTIM_SAVE_COOLDOWN_SECONDS:
+                        self._save_victim_capture(annotated)
+                        self.last_victim_save_time = now
+            except Exception:
+                annotated = frame
+
+            if is_fire:
+                cv2.putText(annotated, "FIRE DETECTED", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+                now = time.time()
+                if now - self.last_fire_save_time >= FIRE_SAVE_COOLDOWN_SECONDS:
+                    self._save_fire_capture(annotated)
+                    self.last_fire_save_time = now
+
+            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+            with self.lock:
+                self.latest_frame = annotated_rgb.copy()
+                if self.recording:
+                    self._ensure_writer(annotated_rgb)
+                    bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+                    self.video_writer.write(bgr)
+
+        with self.lock:
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
 
 
 class DroneApp(tk.Tk):
@@ -254,15 +418,14 @@ class DroneApp(tk.Tk):
         self.configure(bg="#1e1f26")
 
         self.drone = Drone()
+        self.video = None  # set below, but must exist before _refresh_gallery_strip()
+                            # (called from _build_ui path) checks it
         self.pressed = set()
-        self._release_timers = {}          # key -> after() id, for debounce
-        self.busy = False                   # true only while the queue worker is executing
-        self.kill_armed_guard = False       # edge-trigger so combo fires once per hold
+        self._release_timers = {}
+        self.busy = False
+        self.kill_armed_guard = False
         self.quit_armed_guard = False
 
-        # Regular actions (takeoff/land/calibrate/camera toggle) go through this queue
-        # and run one at a time, in order - so pressing L while T is still finishing no
-        # longer gets silently dropped, it just runs automatically right after.
         self.action_queue = queue.Queue()
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
@@ -275,22 +438,22 @@ class DroneApp(tk.Tk):
         self._last_active_move_keys = frozenset()
 
         self._build_ui()
+        self._refresh_gallery_strip()
 
         if VIDEO_AVAILABLE:
             self.video = VideoStream()
             self.video.start()
         else:
             self.video = None
-        self._update_video()  # starts the GUI-side polling loop either way
+        self._update_video()
 
         self.bind_all("<KeyPress>", self._on_key_press)
         self.bind_all("<KeyRelease>", self._on_key_release)
         self.protocol("WM_DELETE_WINDOW", self._quit)
         self.focus_set()
 
-        self._loop()  # start the continuous send/telemetry loop
+        self._loop()
 
-    # ---------------------------------------------------------------- UI
     def _build_ui(self):
         big = tkfont.Font(size=14, weight="bold")
         mono = tkfont.Font(family="Courier", size=11)
@@ -301,16 +464,11 @@ class DroneApp(tk.Tk):
         body = tk.Frame(self, bg="#1e1f26")
         body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
 
-        # ---- left column: live camera / YOLO detection panel ----
         left = tk.Frame(body, bg="#1e1f26")
         left.pack(side="left", fill="both", expand=False, padx=(0, 12))
 
         tk.Label(left, text="CAMERA", font=big, fg="#ffffff", bg="#1e1f26").pack(anchor="w")
         w, h = VIDEO_DISPLAY_SIZE
-        # A plain Label's width/height are in TEXT units (chars/lines), not
-        # pixels, until an image is set. Wrapping it in a fixed-pixel Frame
-        # with pack_propagate(False) keeps the panel a fixed size from the
-        # start, instead of ballooning to fit the placeholder text.
         video_frame = tk.Frame(left, bg="#000000", width=w, height=h)
         video_frame.pack_propagate(False)
         video_frame.pack()
@@ -322,7 +480,28 @@ class DroneApp(tk.Tk):
         tk.Label(left, textvariable=self.camera_dir_var, font=mono, fg="#8fd6ff",
                  bg="#1e1f26").pack(anchor="w", pady=(4, 0))
 
-        # ---- right column: existing status / controls / log ----
+        self.fire_status_var = tk.StringVar(value="Fire: clear")
+        self.fire_status_label = tk.Label(left, textvariable=self.fire_status_var, font=mono,
+                                           fg="#7CFC00", bg="#1e1f26")
+        self.fire_status_label.pack(anchor="w", pady=(2, 0))
+
+        # ---- victim capture gallery ----
+        gallery_header = tk.Frame(left, bg="#1e1f26")
+        gallery_header.pack(fill="x", pady=(14, 4))
+        tk.Label(gallery_header, text="VICTIM CAPTURES", font=big, fg="#ffffff",
+                 bg="#1e1f26").pack(side="left")
+        self.victim_count_var = tk.StringVar(value="(0)")
+        tk.Label(gallery_header, textvariable=self.victim_count_var, font=mono,
+                 fg="#ffb347", bg="#1e1f26").pack(side="left", padx=(6, 0))
+
+        self.gallery_strip = tk.Frame(left, bg="#1e1f26")
+        self.gallery_strip.pack(fill="x", pady=(0, 4))
+        self._gallery_thumb_widgets = []  # keeps widget + PhotoImage refs alive
+
+        tk.Button(left, text="View All Captures", command=self._open_gallery_window,
+                  bg="#33475b", fg="white", activebackground="#3d5871", relief="flat",
+                  font=mono).pack(fill="x", pady=(2, 0))
+
         right = tk.Frame(body, bg="#1e1f26")
         right.pack(side="left", fill="both", expand=True)
 
@@ -342,10 +521,15 @@ class DroneApp(tk.Tk):
 
         help_text = (
             "T = takeoff        L = land (EXPERIMENTAL, 10s)   C = toggle camera dir\n"
+            "R = start/stop video record   P = photo save\n"
             "W/S = forward/back     A/D = roll (tested/opposite)\n"
             "Up/Down = throttle      Left/Right = camera pan\n\n"
             "Hold K + I together = EMERGENCY STOP\n"
-            "Hold Q + I together = QUIT (kills first)"
+            "Hold Q + I together = QUIT (kills first)\n\n"
+            f"Victim captures auto-save (max once every {VICTIM_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
+            "when a person is detected - see gallery, top-left.\n"
+            f"Fire captures auto-save (max once every {FIRE_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
+            "to output/fire when the orange/red heat signature is seen."
         )
         tk.Label(right, text=help_text, font=mono, fg="#888888", bg="#1e1f26",
                  justify="left").pack(pady=10, anchor="w")
@@ -358,11 +542,118 @@ class DroneApp(tk.Tk):
         self.log_box.insert(tk.END, msg)
         self.log_box.yview_moveto(1.0)
 
-    # ------------------------------------------------------------- video
+    #victim gallery
+    def _refresh_gallery_strip(self):
+        """Re-reads the victims folder and redraws the inline thumbnail strip.
+        Runs on its own timer, fully decoupled from the video/flight loops -
+        a stalled camera or a missing PIL install can never affect flying."""
+        all_paths = list_victim_captures()
+        self.victim_count_var.set(f"({len(all_paths)})")
+
+        for w in self._gallery_thumb_widgets:
+            w.destroy()
+        self._gallery_thumb_widgets = []
+
+        recent = all_paths[:GALLERY_MAX_STRIP_THUMBS]
+        if not recent:
+            lbl = tk.Label(self.gallery_strip, text="No captures yet", fg="#666666",
+                            bg="#1e1f26", font=("Courier", 9))
+            lbl.pack(side="left")
+            self._gallery_thumb_widgets.append(lbl)
+        elif not VIDEO_AVAILABLE:
+            lbl = tk.Label(self.gallery_strip, text=f"{len(recent)} saved (install pillow to preview)",
+                            fg="#666666", bg="#1e1f26", font=("Courier", 9))
+            lbl.pack(side="left")
+            self._gallery_thumb_widgets.append(lbl)
+        else:
+            for path in recent:
+                try:
+                    img = Image.open(path)
+                    img.thumbnail(GALLERY_THUMB_SIZE)
+                    photo = ImageTk.PhotoImage(img)
+                except Exception:
+                    continue
+                thumb = tk.Label(self.gallery_strip, image=photo, bg="#000000", cursor="hand2")
+                thumb.image = photo  # keep a reference or Tkinter will garbage-collect it
+                thumb.pack(side="left", padx=2)
+                thumb.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
+                self._gallery_thumb_widgets.append(thumb)
+
+        if self.video is not None:
+            if self.video.fire_active:
+                self.fire_status_var.set("Fire: DETECTED")
+                self.fire_status_label.config(fg="#ff5555")
+            else:
+                self.fire_status_var.set("Fire: clear")
+                self.fire_status_label.config(fg="#7CFC00")
+
+        self.after(GALLERY_REFRESH_MS, self._refresh_gallery_strip)
+
+    def _show_full_image(self, path):
+        """Opens one capture at a larger size in its own window."""
+        top = tk.Toplevel(self)
+        top.title(os.path.basename(path))
+        top.configure(bg="#000000")
+        if not VIDEO_AVAILABLE:
+            tk.Label(top, text="pip install pillow to preview images", fg="white",
+                     bg="#000000").pack(padx=20, pady=20)
+            return
+        try:
+            img = Image.open(path)
+            img.thumbnail(FULL_VIEW_MAX_SIZE)
+            photo = ImageTk.PhotoImage(img)
+            lbl = tk.Label(top, image=photo, bg="#000000")
+            lbl.image = photo
+            lbl.pack()
+        except Exception as e:
+            tk.Label(top, text=f"Could not open image: {e}", fg="white", bg="#000000").pack(padx=20, pady=20)
+
+    def _open_gallery_window(self):
+        """Full scrollable grid of every victim capture saved so far."""
+        top = tk.Toplevel(self)
+        top.title("All Victim Captures")
+        top.geometry("640x480")
+        top.configure(bg="#1e1f26")
+
+        canvas = tk.Canvas(top, bg="#1e1f26", highlightthickness=0)
+        scrollbar = tk.Scrollbar(top, orient="vertical", command=canvas.yview)
+        grid_frame = tk.Frame(canvas, bg="#1e1f26")
+
+        grid_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=grid_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        paths = list_victim_captures()
+        if not paths:
+            tk.Label(grid_frame, text="No captures yet.", fg="#888888", bg="#1e1f26").pack(padx=20, pady=20)
+            return
+        if not VIDEO_AVAILABLE:
+            tk.Label(grid_frame, text=f"{len(paths)} files saved - install pillow to preview them.",
+                     fg="#888888", bg="#1e1f26").pack(padx=20, pady=20)
+            return
+
+        cols = 4
+        thumb_refs = []
+        for i, path in enumerate(paths):
+            try:
+                img = Image.open(path)
+                img.thumbnail((130, 100))
+                photo = ImageTk.PhotoImage(img)
+            except Exception:
+                continue
+            thumb_refs.append(photo)
+            cell = tk.Frame(grid_frame, bg="#1e1f26")
+            cell.grid(row=i // cols, column=i % cols, padx=6, pady=6)
+            lbl = tk.Label(cell, image=photo, bg="#000000", cursor="hand2")
+            lbl.pack()
+            lbl.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
+            tk.Label(cell, text=os.path.basename(path), fg="#888888", bg="#1e1f26",
+                     font=("Courier", 7)).pack()
+        top.thumb_refs = thumb_refs
+
     def _update_video(self):
-        """Polls the background VideoStream for its latest frame and displays
-        it. Runs on its own Tkinter after() timer, independent of the flight
-        loop, so a slow/stalled camera can never affect drone responsiveness."""
         if self.video is None:
             self.video_label.configure(
                 text="Video disabled.\npip install opencv-python ultralytics pillow",
@@ -373,23 +664,17 @@ class DroneApp(tk.Tk):
             if frame is not None:
                 img = Image.fromarray(frame).resize(VIDEO_DISPLAY_SIZE)
                 imgtk = ImageTk.PhotoImage(image=img)
-                self.video_label.imgtk = imgtk  # keep a reference - Tkinter needs this
+                self.video_label.imgtk = imgtk
                 self.video_label.configure(image=imgtk, text="")
             else:
                 self.video_label.configure(text=f"Camera: {self.video.status}", image="")
         self.after(VIDEO_REFRESH_MS, self._update_video)
 
-    # ------------------------------------------------------------ keys
     def _on_key_press(self, event):
         key = event.keysym.lower()
-
-        # DEBUG: logs every key press so you can confirm keys are actually
-        # reaching this handler. If you press L and don't see this line at
-        # all, the window doesn't have keyboard focus - click on it first.
         if key not in self._release_timers and key not in self.pressed:
             self._log(f"[key] {key}")
 
-        # cancel any pending "treat as released" timer - key is still down
         if key in self._release_timers:
             self.after_cancel(self._release_timers.pop(key))
 
@@ -403,9 +688,6 @@ class DroneApp(tk.Tk):
     def _on_key_release(self, event):
         key = event.keysym.lower()
 
-        # don't remove immediately - OS key-repeat sends release+press rapidly
-        # while a key is genuinely held. Wait a beat; if a fresh press cancels
-        # this timer, we know it was just repeat noise, not a real release.
         def actually_release():
             self.pressed.discard(key)
             self._release_timers.pop(key, None)
@@ -421,7 +703,6 @@ class DroneApp(tk.Tk):
         self._release_timers[key] = self.after(KEY_RELEASE_DEBOUNCE_MS, actually_release)
 
     def _handle_single_key(self, key):
-        # No "if busy: return" here anymore - these get queued instead of dropped.
         if key == "t":
             self._enqueue("Taking off...", self.drone.takeoff, done_msg="Airborne.")
         elif key == "l":
@@ -431,10 +712,37 @@ class DroneApp(tk.Tk):
         elif key == "c":
             self._enqueue("Toggling camera direction...", self._do_toggle_camera,
                            done_msg="Camera direction toggled.")
+        elif key == "r":
+            self._toggle_recording()
+        elif key == "p":
+            self._take_snapshot()
+
+    def _toggle_recording(self):
+        if self.video is None:
+            self._log("» video unavailable")
+            return
+        if self.video.recording:
+            self.video.stop_recording()
+            self._log("» recording stopped")
+            self.action_var.set("Recording stopped.")
+        else:
+            self.video.start_recording()
+            self._log("» recording started")
+            self.action_var.set("Recording started.")
+
+    def _take_snapshot(self):
+        if self.video is None:
+            self._log("» video unavailable")
+            return
+        path = self.video.save_snapshot()
+        if path:
+            self._log(f"» photo saved: {path}")
+            self.action_var.set("Photo saved.")
+        else:
+            self._log("» no frame available")
+            self.action_var.set("No frame to save.")
 
     def _do_toggle_camera(self):
-        """Runs on the worker thread - flips camera_facing_down and fires the
-        single 06 01 / 06 02 datagram, then updates the GUI label."""
         now_down = self.drone.toggle_camera_direction()
         label = "downward" if now_down else "forward"
         self.after(0, lambda: self.camera_dir_var.set(f"Camera: {label}"))
@@ -457,15 +765,10 @@ class DroneApp(tk.Tk):
         ))
 
     def _enqueue(self, name, fn, done_msg=""):
-        """Queue an action to run as soon as any currently-running one finishes -
-        pressing a key while another action is mid-flight no longer gets ignored."""
         self._log(f"> queued: {name}")
         self.action_queue.put((name, fn, done_msg))
 
     def _worker_loop(self):
-        """Single background worker - runs queued actions strictly one at a time,
-        so takeoff/land/calibrate/camera-toggle frames never get sent on top of
-        each other."""
         while True:
             name, fn, done_msg = self.action_queue.get()
             self.busy = True
@@ -483,11 +786,7 @@ class DroneApp(tk.Tk):
         self._update_status()
 
     def _fire_kill_now(self):
-        """Kill bypasses the queue entirely and fires immediately, even if a
-        takeoff/land/calibrate/camera-toggle is currently mid-flight - safety
-        comes first."""
         self._log("> EMERGENCY STOP (K+I)")
-        # cancel anything waiting in line so it doesn't run right after the kill
         try:
             while True:
                 self.action_queue.get_nowait()
@@ -505,10 +804,10 @@ class DroneApp(tk.Tk):
             self.status_var.set("ARMED / FLYING")
             self.status_label.config(fg="#55ff55")
         else:
+            #Arpit
             self.status_var.set("DISARMED")
             self.status_label.config(fg="#ff5555")
 
-    # -------------------------------------------------------- flight loop
     def _compute_axes(self):
         b2, b3, b4, b5 = CENTER, CENTER, self.drone.throttle, CENTER
 
@@ -535,9 +834,6 @@ class DroneApp(tk.Tk):
         return b2, b3, b4, b5
 
     def _loop(self):
-        # Paused only while a queued action (T/L/C) is actively sending its own
-        # frames, so we don't interleave a stray idle frame mid-takeoff/land.
-        # Kill runs on its own thread outside this flag, so it's never delayed.
         if not self.busy:
             b2, b3, b4, b5 = self._compute_axes()
             if "up" in self.pressed or "down" in self.pressed:
@@ -548,8 +844,6 @@ class DroneApp(tk.Tk):
         self.after(SEND_INTERVAL_MS, self._loop)
 
     def _log_movement_transition(self):
-        """Logs a line whenever a movement key starts/stops being held, so W/A/S/D
-        etc. give visible confirmation they're actually being detected."""
         active = frozenset(k for k in self.pressed if k in self._move_key_labels)
         if active == self._last_active_move_keys:
             return
