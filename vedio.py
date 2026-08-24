@@ -47,3 +47,5 @@ else:
 
 cap.release()
 cv2.destroyAllWindows()
+
+# D:\SIH\output\record_20260824_130155.avi

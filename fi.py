@@ -6,9 +6,17 @@ frame is auto-saved to output/victims/ (rate-limited, see
 VICTIM_SAVE_COOLDOWN_SECONDS below) and shown in a gallery panel in the
 GUI - both an inline thumbnail strip and a "View All Captures" grid
 
+fire detection: every frame is also checked with a simple HSV color-range
+heuristic (orange/red/yellow + high brightness) for fire-like regions - no
+extra model download needed. If enough matching pixels are found, a red
+"FIRE DETECTED" warning is drawn on the video and shown/logged in the GUI.
+This is a heuristic, not a trained classifier, so false positives are
+possible (sunsets, orange clothing, warm lighting) - search for "fire" to
+find every change.
+
 Everything else in this file is unchanged from the tested branch this
-was built on - only the victim-capture pieces are new (search for
-"victim" to find every change)
+was built on - only the victim-capture and fire-detection pieces are new
+(search for "victim" / "fire" to find every change)
 """
 
 import socket
@@ -22,6 +30,7 @@ import datetime
 
 try:
     import cv2
+    import numpy as np
     from ultralytics import YOLO
     from PIL import Image, ImageTk
     VIDEO_AVAILABLE = True
@@ -35,7 +44,7 @@ RTSP_URL = 1
 YOLO_MODEL_PATH = "software/yolov8n.pt"
 VIDEO_DISPLAY_SIZE = (480, 360)
 VIDEO_REFRESH_MS = 50
-
+RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
 CENTER = 0x80
 MAX_DEV = 0x28
 STICK_MAX = CENTER + MAX_DEV
@@ -62,6 +71,13 @@ GALLERY_THUMB_SIZE = (110, 80)       # inline strip thumbnail size
 GALLERY_MAX_STRIP_THUMBS = 5         # how many recent thumbnails show inline
 GALLERY_REFRESH_MS = 2000            # how often the GUI re-checks the folder
 FULL_VIEW_MAX_SIZE = (900, 700)      # cap for the "click to enlarge" popup
+
+# ---- fire detection (color-based heuristic, no model download needed) ----
+FIRE_HSV_LOWER = (0, 120, 200)     # orange/red/yellow, high saturation+brightness
+FIRE_HSV_UPPER = (35, 255, 255)
+FIRE_PIXEL_THRESHOLD = 3000        # min matching pixels to call it "fire" - tune by testing
+FIRE_SAVE_COOLDOWN_SECONDS = 5.0   # same idea as victim cooldown, avoid spamming disk
+FIRE_DIR = os.path.join(SAVE_DIR, "fire")
 
 
 def list_victim_captures(limit=None):
@@ -165,8 +181,14 @@ class VideoStream:
         self.video_writer = None
         self.record_path = None
         self.last_victim_save_time = 0.0
+
+        # ---- fire detection state ----
+        self.fire_detected = False
+        self.last_fire_save_time = 0.0
+
         os.makedirs(SAVE_DIR, exist_ok=True)
         os.makedirs(VICTIM_DIR, exist_ok=True)
+        os.makedirs(FIRE_DIR, exist_ok=True)
 
     def start(self):
         self.running = True
@@ -179,6 +201,10 @@ class VideoStream:
     def get_latest(self):
         with self.lock:
             return None if self.latest_frame is None else self.latest_frame.copy()
+
+    def get_fire_status(self):
+        with self.lock:
+            return self.fire_detected
 
     def start_recording(self):
         with self.lock:
@@ -218,10 +244,31 @@ class VideoStream:
             pass
         return False
 
+    def _detect_fire(self, bgr_frame):
+        """Simple HSV color-range heuristic for fire-like regions - orange/
+        red/yellow with high brightness. Not a trained classifier, so it
+        can false-positive on sunsets, warm lighting, orange clothing, etc.
+        Returns (is_fire, pixel_count)."""
+        try:
+            hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, np.array(FIRE_HSV_LOWER), np.array(FIRE_HSV_UPPER))
+            count = int(cv2.countNonZero(mask))
+            return count >= FIRE_PIXEL_THRESHOLD, count
+        except Exception:
+            return False, 0
+
     def _save_victim_capture(self, annotated_bgr):
         #Saves the annotated frame
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = os.path.join(VICTIM_DIR, f"victim_{ts}.jpg")
+        try:
+            cv2.imwrite(path, annotated_bgr)
+        except Exception:
+            pass
+
+    def _save_fire_capture(self, annotated_bgr):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = os.path.join(FIRE_DIR, f"fire_{ts}.jpg")
         try:
             cv2.imwrite(path, annotated_bgr)
         except Exception:
@@ -246,13 +293,25 @@ class VideoStream:
 
         self.status = "connecting to stream..."
         self.cap = cv2.VideoCapture(self.url)
+        # Keep OpenCV's internal buffer as small as possible - without this,
+        # frames pile up whenever inference is slower than the camera's
+        # frame rate, and the feed drifts further and further behind
+        # real-time the longer it runs.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.cap.isOpened():
             self.status = "stream not available (check RTSP URL / drone connection)"
             return
         self.status = "live"
 
         while self.running:
-            ret, frame = self.cap.read()
+            # Flush any backlog: grab() pulls a frame off the stream buffer
+            # without decoding it (cheap), retrieve() decodes only the
+            # newest one. Keeps the feed close to real-time even if
+            # BUFFERSIZE above gets ignored by the backend (some do).
+            for _ in range(3):
+                if not self.cap.grab():
+                    break
+            ret, frame = self.cap.retrieve()
             if not ret:
                 self.status = "frame lost - stream ended"
                 break
@@ -266,10 +325,22 @@ class VideoStream:
                         self.last_victim_save_time = now
             except Exception:
                 annotated = frame
+
+            # ---- fire detection: run on the raw frame, draw + save if found ----
+            is_fire, fire_px = self._detect_fire(frame)
+            if is_fire:
+                cv2.putText(annotated, f"FIRE DETECTED ({fire_px}px)", (15, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                now = time.time()
+                if now - self.last_fire_save_time >= FIRE_SAVE_COOLDOWN_SECONDS:
+                    self._save_fire_capture(annotated)
+                    self.last_fire_save_time = now
+
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
             with self.lock:
                 self.latest_frame = annotated_rgb.copy()
+                self.fire_detected = is_fire
                 if self.recording:
                     self._ensure_writer(annotated_rgb)
                     bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
@@ -298,6 +369,8 @@ class DroneApp(tk.Tk):
         self.busy = False
         self.kill_armed_guard = False
         self.quit_armed_guard = False
+
+        self._last_fire_status = False  # tracks fire state for log-on-change
 
         self.action_queue = queue.Queue()
         threading.Thread(target=self._worker_loop, daemon=True).start()
@@ -353,6 +426,12 @@ class DroneApp(tk.Tk):
         tk.Label(left, textvariable=self.camera_dir_var, font=mono, fg="#8fd6ff",
                  bg="#1e1f26").pack(anchor="w", pady=(4, 0))
 
+        # ---- fire status indicator ----
+        self.fire_status_var = tk.StringVar(value="Fire: none detected")
+        self.fire_status_label = tk.Label(left, textvariable=self.fire_status_var, font=mono,
+                                           fg="#888888", bg="#1e1f26")
+        self.fire_status_label.pack(anchor="w", pady=(2, 0))
+
         # ---- victim capture gallery ----
         gallery_header = tk.Frame(left, bg="#1e1f26")
         gallery_header.pack(fill="x", pady=(14, 4))
@@ -395,7 +474,9 @@ class DroneApp(tk.Tk):
             "Hold K + I together = EMERGENCY STOP\n"
             "Hold Q + I together = QUIT (kills first)\n\n"
             f"Victim captures auto-save (max once every {VICTIM_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
-            "when a person is detected - see gallery, top-left."
+            "when a person is detected - see gallery, top-left.\n"
+            "Fire is flagged live on the video (color heuristic) and\n"
+            f"auto-saved to output/fire/ (max once every {FIRE_SAVE_COOLDOWN_SECONDS:.0f}s)."
         )
         tk.Label(right, text=help_text, font=mono, fg="#888888", bg="#1e1f26",
                  justify="left").pack(pady=10, anchor="w")
@@ -526,6 +607,19 @@ class DroneApp(tk.Tk):
                 self.video_label.configure(image=imgtk, text="")
             else:
                 self.video_label.configure(text=f"Camera: {self.video.status}", image="")
+
+            # ---- fire status: update label + log only on change ----
+            fire_now = self.video.get_fire_status()
+            if fire_now:
+                self.fire_status_var.set("Fire: DETECTED")
+                self.fire_status_label.config(fg="#ff3b3b")
+            else:
+                self.fire_status_var.set("Fire: none detected")
+                self.fire_status_label.config(fg="#888888")
+            if fire_now != self._last_fire_status:
+                self._last_fire_status = fire_now
+                self._log("» FIRE DETECTED" if fire_now else "» fire cleared")
+
         self.after(VIDEO_REFRESH_MS, self._update_video)
 
     def _on_key_press(self, event):
