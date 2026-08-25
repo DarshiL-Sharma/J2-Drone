@@ -1,5 +1,14 @@
 """
-This is the code where we need to add the thing so that the delay oc clicking images and the display we need to compare with the other code
+Drone Control - GUI with keyboard flying, live camera/object detection,
+manual photo/recording save.py-->aayush, and automatic victim-capture +
+gallery-->arpit: whenever the YOLO feed detects a person, the annotated
+frame is auto-saved to output/victims/ (rate-limited, see
+VICTIM_SAVE_COOLDOWN_SECONDS below) and shown in a gallery panel in the
+GUI - both an inline thumbnail strip and a "View All Captures" grid
+
+Everything else in this file is unchanged from the tested branch this
+was built on - only the victim-capture pieces are new (search for
+"victim" to find every change)
 """
 
 import socket
@@ -13,7 +22,6 @@ import datetime
 
 try:
     import cv2
-    import numpy as np
     from ultralytics import YOLO
     from PIL import Image, ImageTk
     VIDEO_AVAILABLE = True
@@ -23,24 +31,10 @@ except ImportError:
 DRONE_IP = "192.168.1.1"
 DRONE_PORT = 7099
 
-RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
+RTSP_URL = 1
 YOLO_MODEL_PATH = "software/yolov8n.pt"
 VIDEO_DISPLAY_SIZE = (480, 360)
 VIDEO_REFRESH_MS = 50
-
-# --- Camera tilt correction ---------------------------------------------
-# Your hardware camera sits slightly rotated in its mount, so every frame
-# comes in a few degrees off-level. Rather than touching the hardware, we
-# just rotate each frame back straight before it's shown/detected on.
-# Positive angle = rotate counter-clockwise, negative = clockwise.
-# Start small (5-15 degrees) and adjust until the horizon looks level.
-CAMERA_TILT_ANGLE = 7.5
-
-# --- Fire detection (color/HSV heuristic - no model needed) -------------
-FIRE_LOWER_HSV = (0, 120, 200)
-FIRE_UPPER_HSV = (35, 255, 255)
-FIRE_PIXEL_THRESHOLD = 3000     # tune against your footage
-FIRE_SAVE_COOLDOWN_SECONDS = 5.0
 
 CENTER = 0x80
 MAX_DEV = 0x28
@@ -68,34 +62,6 @@ GALLERY_THUMB_SIZE = (110, 80)       # inline strip thumbnail size
 GALLERY_MAX_STRIP_THUMBS = 5         # how many recent thumbnails show inline
 GALLERY_REFRESH_MS = 2000            # how often the GUI re-checks the folder
 FULL_VIEW_MAX_SIZE = (900, 700)      # cap for the "click to enlarge" popup
-
-# Fire capture autosave, same pattern as the victim folder
-FIRE_DIR = os.path.join(SAVE_DIR, "fire")
-
-
-def fix_tilt(frame, angle=CAMERA_TILT_ANGLE):
-    """Rotates a frame around its center to correct a physically tilted
-    camera mount. Cheap (one warpAffine per frame) and keeps the original
-    frame size, so nothing downstream (YOLO, display resize) needs to change."""
-    if not angle:
-        return frame
-    h, w = frame.shape[:2]
-    center = (w // 2, h // 2)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(frame, matrix, (w, h))
-
-
-def detect_fire(frame_bgr):
-    """Heuristic, no-model fire detector: fire pixels tend to sit in a fairly
-    narrow orange/red/yellow + high-brightness band in HSV, so we threshold
-    for that band and count how many pixels match. Returns (is_fire, mask)."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    lower = np.array(FIRE_LOWER_HSV)
-    upper = np.array(FIRE_UPPER_HSV)
-    mask = cv2.inRange(hsv, lower, upper)
-    fire_pixel_count = cv2.countNonZero(mask)
-    is_fire = fire_pixel_count > FIRE_PIXEL_THRESHOLD
-    return is_fire, mask
 
 
 def list_victim_captures(limit=None):
@@ -187,53 +153,24 @@ class Drone:
 
 
 class VideoStream:
-    """
-    Delay fix: previously a single loop did capture + YOLO inference back to
-    back. cap.read() on an RTSP stream keeps an internal buffer, and if
-    inference (the slow part) can't keep up with the incoming frame rate,
-    frames pile up in that buffer - so what you SEE on screen is always a
-    few frames (i.e. real seconds) behind live. That backlog only grows over
-    time, it never catches up on its own.
-
-    Fix: split capture and processing into two independent threads.
-      - _capture_loop does nothing but grab frames as fast as the stream
-        provides them and immediately overwrite self._latest_raw. It never
-        waits on YOLO/fire-detection, so OpenCV's internal buffer never
-        has a chance to build up a backlog.
-      - _process_loop always grabs whatever is CURRENTLY in self._latest_raw
-        (never a queue), runs tilt-fix + fire detection + YOLO on it, and
-        publishes the result to self.latest_frame for the GUI to display.
-        If inference is slower than the camera's frame rate, older frames
-        are simply skipped instead of queued - you always see the most
-        recent reality, not a growing backlog of old frames.
-    """
-
     def __init__(self, url=RTSP_URL, model_path=YOLO_MODEL_PATH):
         self.url = url
         self.model_path = model_path
         self.cap = None
-        self.latest_frame = None       # annotated RGB frame for display
-        self._latest_raw = None        # newest raw BGR frame from the camera
-        self._raw_frame_id = 0         # bumped every time a new raw frame lands
-        self._last_processed_id = -1
+        self.latest_frame = None
         self.lock = threading.Lock()
-        self.raw_lock = threading.Lock()
         self.running = False
         self.status = "not started"
         self.recording = False
         self.video_writer = None
         self.record_path = None
         self.last_victim_save_time = 0.0
-        self.last_fire_save_time = 0.0
-        self.fire_active = False
         os.makedirs(SAVE_DIR, exist_ok=True)
         os.makedirs(VICTIM_DIR, exist_ok=True)
-        os.makedirs(FIRE_DIR, exist_ok=True)
 
     def start(self):
         self.running = True
-        threading.Thread(target=self._capture_loop, daemon=True).start()
-        threading.Thread(target=self._process_loop, daemon=True).start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
         self.running = False
@@ -290,14 +227,6 @@ class VideoStream:
         except Exception:
             pass
 
-    def _save_fire_capture(self, annotated_bgr):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        path = os.path.join(FIRE_DIR, f"fire_{ts}.jpg")
-        try:
-            cv2.imwrite(path, annotated_bgr)
-        except Exception:
-            pass
-
     def _ensure_writer(self, frame_rgb):
         if self.video_writer is not None:
             return
@@ -307,21 +236,16 @@ class VideoStream:
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
         self.video_writer = cv2.VideoWriter(self.record_path, fourcc, 20.0, (w, h))
 
-    def _capture_loop(self):
-        """Only job: keep self._latest_raw as fresh as physically possible.
-        Never touches YOLO/fire-detection, so it can never be slowed down
-        by them - that's what stops the display lag from building up."""
-        self.status = "connecting to stream..."
-
-        # CAP_PROP_BUFFERSIZE=1 asks the backend to keep at most one frame
-        # queued internally (support varies by backend, but it's free to try
-        # and helps on backends that honor it).
-        self.cap = cv2.VideoCapture(self.url)
+    def _loop(self):
+        self.status = "loading YOLO model..."
         try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+            model = YOLO(self.model_path)
+        except Exception as e:
+            self.status = f"model load failed: {e}"
+            return
 
+        self.status = "connecting to stream..."
+        self.cap = cv2.VideoCapture(self.url)
         if not self.cap.isOpened():
             self.status = "stream not available (check RTSP URL / drone connection)"
             return
@@ -332,50 +256,6 @@ class VideoStream:
             if not ret:
                 self.status = "frame lost - stream ended"
                 break
-            with self.raw_lock:
-                self._latest_raw = frame
-                self._raw_frame_id += 1
-
-        if self.cap:
-            self.cap.release()
-        if self.status == "live":
-            self.status = "stopped"
-
-    def _get_latest_raw(self):
-        with self.raw_lock:
-            if self._latest_raw is None or self._raw_frame_id == self._last_processed_id:
-                return None, None
-            return self._latest_raw.copy(), self._raw_frame_id
-
-    def _process_loop(self):
-        self.status = "loading YOLO model..."
-        try:
-            model = YOLO(self.model_path)
-        except Exception as e:
-            self.status = f"model load failed: {e}"
-            return
-
-        # wait for the capture thread to actually start producing frames
-        while self.running and self._latest_raw is None:
-            time.sleep(0.01)
-
-        while self.running:
-            frame, frame_id = self._get_latest_raw()
-            if frame is None:
-                time.sleep(0.005)
-                continue
-            self._last_processed_id = frame_id
-
-            # Correct the physical camera-mount tilt before doing anything
-            # else with this frame (detection + display both benefit).
-            frame = fix_tilt(frame, CAMERA_TILT_ANGLE)
-
-            try:
-                is_fire, _fire_mask = detect_fire(frame)
-            except Exception:
-                is_fire = False
-            self.fire_active = is_fire
-
             try:
                 results = model(frame, verbose=False)
                 annotated = results[0].plot()
@@ -386,15 +266,6 @@ class VideoStream:
                         self.last_victim_save_time = now
             except Exception:
                 annotated = frame
-
-            if is_fire:
-                cv2.putText(annotated, "FIRE DETECTED", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
-                now = time.time()
-                if now - self.last_fire_save_time >= FIRE_SAVE_COOLDOWN_SECONDS:
-                    self._save_fire_capture(annotated)
-                    self.last_fire_save_time = now
-
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
             with self.lock:
@@ -404,10 +275,14 @@ class VideoStream:
                     bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
                     self.video_writer.write(bgr)
 
+        if self.cap:
+            self.cap.release()
         with self.lock:
             if self.video_writer is not None:
                 self.video_writer.release()
                 self.video_writer = None
+        if self.status == "live":
+            self.status = "stopped"
 
 
 class DroneApp(tk.Tk):
@@ -418,8 +293,6 @@ class DroneApp(tk.Tk):
         self.configure(bg="#1e1f26")
 
         self.drone = Drone()
-        self.video = None  # set below, but must exist before _refresh_gallery_strip()
-                            # (called from _build_ui path) checks it
         self.pressed = set()
         self._release_timers = {}
         self.busy = False
@@ -480,11 +353,6 @@ class DroneApp(tk.Tk):
         tk.Label(left, textvariable=self.camera_dir_var, font=mono, fg="#8fd6ff",
                  bg="#1e1f26").pack(anchor="w", pady=(4, 0))
 
-        self.fire_status_var = tk.StringVar(value="Fire: clear")
-        self.fire_status_label = tk.Label(left, textvariable=self.fire_status_var, font=mono,
-                                           fg="#7CFC00", bg="#1e1f26")
-        self.fire_status_label.pack(anchor="w", pady=(2, 0))
-
         # ---- victim capture gallery ----
         gallery_header = tk.Frame(left, bg="#1e1f26")
         gallery_header.pack(fill="x", pady=(14, 4))
@@ -527,9 +395,7 @@ class DroneApp(tk.Tk):
             "Hold K + I together = EMERGENCY STOP\n"
             "Hold Q + I together = QUIT (kills first)\n\n"
             f"Victim captures auto-save (max once every {VICTIM_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
-            "when a person is detected - see gallery, top-left.\n"
-            f"Fire captures auto-save (max once every {FIRE_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
-            "to output/fire when the orange/red heat signature is seen."
+            "when a person is detected - see gallery, top-left."
         )
         tk.Label(right, text=help_text, font=mono, fg="#888888", bg="#1e1f26",
                  justify="left").pack(pady=10, anchor="w")
@@ -578,14 +444,6 @@ class DroneApp(tk.Tk):
                 thumb.pack(side="left", padx=2)
                 thumb.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
                 self._gallery_thumb_widgets.append(thumb)
-
-        if self.video is not None:
-            if self.video.fire_active:
-                self.fire_status_var.set("Fire: DETECTED")
-                self.fire_status_label.config(fg="#ff5555")
-            else:
-                self.fire_status_var.set("Fire: clear")
-                self.fire_status_label.config(fg="#7CFC00")
 
         self.after(GALLERY_REFRESH_MS, self._refresh_gallery_strip)
 
