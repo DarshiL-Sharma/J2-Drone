@@ -1,30 +1,3 @@
-"""
-Interactive drone control - built from reverse-engineered WiFi protocol.
-
-Frame format (9 bytes):
-    03 66 [B2] [B3] [B4] [B5] [CMD] [CHK] 99
-           Roll Pitch Throttle Yaw  Cmd   Checksum
-
-CONFIRMED from packet captures:
-    - Checksum = B2 ^ B3 ^ B4 ^ B5 ^ CMD  (verified against every captured frame)
-    - CMD 0x00 = idle / calibrate (sent continuously at ~20Hz as a heartbeat)
-    - CMD 0x01 = takeoff
-    - CMD 0x04 = emergency stop (cuts motors instantly - NOT a landing)
-    - All stick axes range roughly 0x58 (min) to 0xA8 (max) around center 0x80
-    - Forward = pitch (B3) above center, up to ~0xA8
-    - Backward = pitch (B3) below center, down to ~0x58 (by symmetry, unconfirmed)
-    - Landing = throttle (B4) ramped down to 0x00 over ~0.4-0.5s, CMD stays 0x00
-      (there is no dedicated "land" CMD value in this protocol)
-
-UNCONFIRMED - flagged in the relevant functions below, verify before relying on them:
-    - Which physical direction (left vs right) each roll byte range produces -
-      you observed pressing "left" made the drone visibly go right, most likely
-      because the drone was facing toward you rather than away. Re-test with
-      the drone facing away from you before trusting the left/right naming.
-    - Camera pan direction mapping - your capture showed jittery values with
-      B5 hitting full extremes (0x01 / 0xFF), separate from the flight-stick
-      range, but the two directions weren't cleanly isolated in that capture.
-"""
 
 import socket
 import time
@@ -146,7 +119,7 @@ class Drone:
 
 
 MENU = """
-Commands:
+CommandsCenter:
   cal              - calibrate / center (idle)
   takeoff          - take off
   fwd [sec]        - move forward
