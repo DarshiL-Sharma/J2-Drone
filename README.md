@@ -7,7 +7,7 @@ Autonomous drone system for disaster-affected areas with on-device AI for surviv
 Clone the repository:
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/DarshiL-Sharma/J2-Drone.git>
 cd Drone
 ```
 

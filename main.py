@@ -3,3 +3,7 @@ print("Code is running please wait ........")
 from DisplayCenter.Display import DroneApp
 if __name__ == "__main__":
     DroneApp().mainloop()
+
+
+
+

@@ -107,6 +107,11 @@ class DroneApp(tk.Tk):
                                            fg="#7CFC00", bg="#1e1f26")
         self.fire_status_label.pack(anchor="w", pady=(2, 0))
 
+        self.smoke_status_var = tk.StringVar(value="Smoke: clear")
+        self.smoke_status_label = tk.Label(left, textvariable=self.smoke_status_var, font=mono,
+                                            fg="#7CFC00", bg="#1e1f26")
+        self.smoke_status_label.pack(anchor="w", pady=(2, 0))
+
         # ---- victim capture gallery ----
         gallery_header = tk.Frame(left, bg="#1e1f26")
         gallery_header.pack(fill="x", pady=(14, 4))
@@ -116,8 +121,22 @@ class DroneApp(tk.Tk):
         tk.Label(gallery_header, textvariable=self.victim_count_var, font=mono,
                  fg="#ffb347", bg="#1e1f26").pack(side="left", padx=(6, 0))
 
-        self.gallery_strip = tk.Frame(left, bg="#1e1f26")
-        self.gallery_strip.pack(fill="x", pady=(0, 4))
+        thumb_h = GALLERY_THUMB_SIZE[1] if isinstance(GALLERY_THUMB_SIZE, (tuple, list)) else 80
+        strip_container = tk.Frame(left, bg="#1e1f26")
+        strip_container.pack(fill="x", pady=(0, 4))
+        self.gallery_canvas = tk.Canvas(strip_container, bg="#1e1f26",
+                                         height=thumb_h + 10, highlightthickness=0)
+        gallery_scrollbar = tk.Scrollbar(strip_container, orient="horizontal",
+                                          command=self.gallery_canvas.xview)
+        self.gallery_strip = tk.Frame(self.gallery_canvas, bg="#1e1f26")
+        self.gallery_strip.bind(
+            "<Configure>",
+            lambda e: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+        )
+        self.gallery_canvas.create_window((0, 0), window=self.gallery_strip, anchor="nw")
+        self.gallery_canvas.configure(xscrollcommand=gallery_scrollbar.set)
+        self.gallery_canvas.pack(side="top", fill="x")
+        gallery_scrollbar.pack(side="top", fill="x")
         self._gallery_thumb_widgets = []  # keeps widget + PhotoImage refs alive
 
         tk.Button(left, text="View All Captures", command=self._open_gallery_window,
@@ -208,6 +227,13 @@ class DroneApp(tk.Tk):
             else:
                 self.fire_status_var.set("Fire: clear")
                 self.fire_status_label.config(fg="#7CFC00")
+
+            if self.video.smoke_active:
+                self.smoke_status_var.set("Smoke: DETECTED")
+                self.smoke_status_label.config(fg="#ff5555")
+            else:
+                self.smoke_status_var.set("Smoke: clear")
+                self.smoke_status_label.config(fg="#7CFC00")
 
         self.after(GALLERY_REFRESH_MS, self._refresh_gallery_strip)
 

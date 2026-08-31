@@ -1,8 +1,5 @@
 from ConstantsCenter.constants import (
     CAMERA_TILT_ANGLE,
-    FIRE_LOWER_HSV,
-    FIRE_UPPER_HSV,
-    FIRE_PIXEL_THRESHOLD,
     CENTER,
     CMD_IDLE,
 )
@@ -20,14 +17,35 @@ def fix_tilt(frame, angle=CAMERA_TILT_ANGLE):
     return cv2.warpAffine(frame, matrix, (w, h))
 
 
-def detect_fire(frame_bgr):
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    lower = np.array(FIRE_LOWER_HSV)
-    upper = np.array(FIRE_UPPER_HSV)
-    mask = cv2.inRange(hsv, lower, upper)
-    fire_pixel_count = cv2.countNonZero(mask)
-    is_fire = fire_pixel_count > FIRE_PIXEL_THRESHOLD
-    return is_fire, mask
+def draw_fire_smoke_boxes(annotated, fire_results, conf_threshold):
+    is_fire = False
+    is_smoke = False
+    try:
+        boxes = fire_results[0].boxes
+        names = fire_results[0].names
+        if boxes is None:
+            return is_fire, is_smoke
+        for box in boxes:
+            conf = float(box.conf[0])
+            if conf < conf_threshold:
+                continue
+            cls_id = int(box.cls[0])
+            label = names.get(cls_id, str(cls_id)).lower()
+            if label == "fire":
+                is_fire = True
+                color = (0, 0, 255)
+            elif label == "smoke":
+                is_smoke = True
+                color = (0, 165, 255)
+            else:
+                color = (0, 255, 255)
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    except Exception:
+        pass
+    return is_fire, is_smoke
 
 
 def list_victim_captures(limit=None):
@@ -50,4 +68,3 @@ def build_frame(b2=CENTER, b3=CENTER, b4=CENTER, b5=CENTER, cmd=CMD_IDLE):
     b2, b3, b4, b5, cmd = (max(0, min(0xFF, int(v))) for v in (b2, b3, b4, b5, cmd))
     chk = checksum(b2, b3, b4, b5, cmd)
     return bytes([0x03, 0x66, b2, b3, b4, b5, cmd, chk, 0x99])
-

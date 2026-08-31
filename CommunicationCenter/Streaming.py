@@ -1,6 +1,8 @@
 from ConstantsCenter.constants import (
     RTSP_URL,
     YOLO_MODEL_PATH,
+    FIRE_SMOKE_MODEL_PATH,
+    FIRE_SMOKE_CONF_THRESHOLD,
     CAMERA_TILT_ANGLE,
     FIRE_SAVE_COOLDOWN_SECONDS,
     VICTIM_SAVE_COOLDOWN_SECONDS,
@@ -12,11 +14,13 @@ from ultralytics import YOLO
 import os
 import datetime
 import time
-from CommunicationCenter.communication import detect_fire,fix_tilt
+from CommunicationCenter.communication import draw_fire_smoke_boxes, fix_tilt
 class VideoStream:
-    def __init__(self, url=RTSP_URL, model_path=YOLO_MODEL_PATH):
+    def __init__(self, url=RTSP_URL, model_path=YOLO_MODEL_PATH,
+                 fire_smoke_model_path=FIRE_SMOKE_MODEL_PATH):
         self.url = url
         self.model_path = model_path
+        self.fire_smoke_model_path = fire_smoke_model_path
         self.cap = None
         self.latest_frame = None
         self._latest_raw = None
@@ -32,6 +36,7 @@ class VideoStream:
         self.last_victim_save_time = 0.0
         self.last_fire_save_time = 0.0
         self.fire_active = False
+        self.smoke_active = False
         os.makedirs(SAVE_DIR, exist_ok=True)
         os.makedirs(VICTIM_DIR, exist_ok=True)
         os.makedirs(FIRE_DIR, exist_ok=True)
@@ -89,17 +94,21 @@ class VideoStream:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = os.path.join(VICTIM_DIR, f"victim_{ts}.jpg")
         try:
-            cv2.imwrite(path, annotated_bgr)
-        except Exception:
-            pass
+            os.makedirs(VICTIM_DIR, exist_ok=True)
+            ok = cv2.imwrite(path, annotated_bgr)
+            print(f"[victim capture] saved: {path}" if ok else f"[victim capture] FAILED to write: {path}")
+        except Exception as e:
+            print(f"[victim capture] ERROR: {e}")
 
     def _save_fire_capture(self, annotated_bgr):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = os.path.join(FIRE_DIR, f"fire_{ts}.jpg")
         try:
-            cv2.imwrite(path, annotated_bgr)
-        except Exception:
-            pass
+            os.makedirs(FIRE_DIR, exist_ok=True)
+            ok = cv2.imwrite(path, annotated_bgr)
+            print(f"[fire/smoke capture] saved: {path}" if ok else f"[fire/smoke capture] FAILED to write: {path}")
+        except Exception as e:
+            print(f"[fire/smoke capture] ERROR: {e}")
 
     def _ensure_writer(self, frame_rgb):
         if self.video_writer is not None:
@@ -112,6 +121,12 @@ class VideoStream:
 
     def _capture_loop(self):
         self.status = "connecting to stream..."
+        # Force RTSP over TCP instead of the OpenCV/FFmpeg default (UDP).
+        # UDP drops packets silently on WiFi interference, which corrupts or
+        # freezes frames. TCP retransmits lost packets - slightly higher
+        # latency, but far fewer freezes on a noisy WiFi link like the drone's.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
         self.cap = cv2.VideoCapture(self.url)
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -123,11 +138,37 @@ class VideoStream:
             return
         self.status = "live"
 
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 30  # ~ a few seconds of bad reads before we reconnect
+
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
-                self.status = "frame lost - stream ended"
-                break
+                consecutive_failures += 1
+                self.status = "stream glitching - reconnecting..."
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    # Full reconnect: release and reopen the stream instead of
+                    # giving up. A single dropped WiFi packet used to kill the
+                    # whole capture loop permanently - this keeps it alive.
+                    self.cap.release()
+                    time.sleep(0.5)
+                    self.cap = cv2.VideoCapture(self.url)
+                    try:
+                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+                    consecutive_failures = 0
+                    if self.cap.isOpened():
+                        self.status = "live"
+                    else:
+                        self.status = "reconnect failed - retrying..."
+                else:
+                    time.sleep(0.05)
+                continue
+
+            consecutive_failures = 0
+            if self.status != "live":
+                self.status = "live"
             with self.raw_lock:
                 self._latest_raw = frame
                 self._raw_frame_id += 1
@@ -144,11 +185,16 @@ class VideoStream:
             return self._latest_raw.copy(), self._raw_frame_id
 
     def _process_loop(self):
-        self.status = "loading YOLO model..."
+        self.status = "loading YOLO models..."
         try:
             model = YOLO(self.model_path)
         except Exception as e:
-            self.status = f"model load failed: {e}"
+            self.status = f"person model load failed: {e}"
+            return
+        try:
+            fire_smoke_model = YOLO(self.fire_smoke_model_path)
+        except Exception as e:
+            self.status = f"fire/smoke model load failed: {e}"
             return
 
         # wait for the capture thread to actually start producing frames
@@ -166,12 +212,6 @@ class VideoStream:
             frame = fix_tilt(frame, CAMERA_TILT_ANGLE)
 
             try:
-                is_fire, _fire_mask = detect_fire(frame)
-            except Exception:
-                is_fire = False
-            self.fire_active = is_fire
-
-            try:
                 results = model(frame, verbose=False)
                 annotated = results[0].plot()
                 if self._contains_person(results):
@@ -182,8 +222,18 @@ class VideoStream:
             except Exception:
                 annotated = frame
 
-            if is_fire:
-                cv2.putText(annotated, "FIRE DETECTED", (10, 30),
+            try:
+                fire_results = fire_smoke_model(frame, verbose=False)
+                is_fire, is_smoke = draw_fire_smoke_boxes(annotated, fire_results, FIRE_SMOKE_CONF_THRESHOLD)
+            except Exception:
+                is_fire, is_smoke = False, False
+
+            self.fire_active = is_fire
+            self.smoke_active = is_smoke
+
+            if is_fire or is_smoke:
+                label = "FIRE DETECTED" if is_fire else "SMOKE DETECTED"
+                cv2.putText(annotated, label, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
                 now = time.time()
                 if now - self.last_fire_save_time >= FIRE_SAVE_COOLDOWN_SECONDS:
