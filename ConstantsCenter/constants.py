@@ -4,7 +4,7 @@ DRONE_IP = "192.168.1.1"
 DRONE_PORT = 7099
 
 RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
-YOLO_MODEL_PATH = "software/yolov8n.pt"
+YOLO_MODEL_PATH = r"software\yolov8n.pt"
 VIDEO_DISPLAY_SIZE = (480, 360)
 VIDEO_REFRESH_MS = 50
 SAVE_DIR = "output"
@@ -14,7 +14,7 @@ CAMERA_TILT_ANGLE = 7.5
 
 
 #Fire/smoke detection via trained YOLO model
-FIRE_SMOKE_MODEL_PATH = "software/best.pt"
+FIRE_SMOKE_MODEL_PATH = r"software\best.pt"
 FIRE_SMOKE_CONF_THRESHOLD = 0.40
 FIRE_SAVE_COOLDOWN_SECONDS = 5.0
 
