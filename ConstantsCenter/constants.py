@@ -1,0 +1,50 @@
+import os
+
+DRONE_IP = "192.168.1.1"
+DRONE_PORT = 7099
+
+RTSP_URL = "rtsp://192.168.1.1:7070/webcam"
+YOLO_MODEL_PATH = "software/yolov8n.pt"
+VIDEO_DISPLAY_SIZE = (480, 360)
+VIDEO_REFRESH_MS = 50
+SAVE_DIR = "output"
+VICTIM_DIR = os.path.join(SAVE_DIR, "victims")
+FIRE_DIR = os.path.join(SAVE_DIR, "fire")
+CAMERA_TILT_ANGLE = 7.5
+
+
+#Fire/smoke detection via trained YOLO model
+FIRE_SMOKE_MODEL_PATH = "software/best.pt"
+FIRE_SMOKE_CONF_THRESHOLD = 0.70
+FIRE_SAVE_COOLDOWN_SECONDS = 5.0
+
+CENTER = 0x80
+MAX_DEV = 0x28
+STICK_MAX = CENTER + MAX_DEV
+STICK_MIN = CENTER - MAX_DEV
+
+CMD_IDLE = 0x00
+CMD_TAKEOFF = 0x01
+CMD_KILL = 0x04
+CAMERA_FORWARD_FRAME = bytes.fromhex("0601")
+CAMERA_DOWN_FRAME = bytes.fromhex("0602")
+SEND_INTERVAL_MS = 50
+KEY_RELEASE_DEBOUNCE_MS = 60
+LAND_FAILSAFE_SECONDS = 3.0
+
+#Victim capture & autosave to gallery
+VICTIM_SAVE_COOLDOWN_SECONDS = 5.0
+GALLERY_THUMB_SIZE = (110, 80)
+GALLERY_MAX_STRIP_THUMBS = 5
+GALLERY_REFRESH_MS = 2000
+FULL_VIEW_MAX_SIZE = (900, 700)
+
+# Dead Reckoning System
+SPEED=3.5
+
+# SOS alerts (from the companion mobile app - name/phone/health/location +
+# front & back camera photos, sent when the survivor presses the SOS button)
+SOS_DIR = os.path.join(SAVE_DIR, "sos")
+SOS_DB_PATH = os.path.join(SAVE_DIR, "sos_reports.db")
+SOS_REFRESH_MS = 3000
+SOS_THUMB_SIZE = (70, 70)
