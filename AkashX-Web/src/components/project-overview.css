@@ -1,0 +1,65 @@
+.overview-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 60px;
+}
+
+.overview-copy .section-title { margin: 14px 0 30px; }
+
+.overview-points {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.overview-points li {
+  position: relative;
+  padding-left: 22px;
+  color: var(--text-dim);
+  font-size: 15.5px;
+  line-height: 1.65;
+  max-width: 52ch;
+}
+
+.overview-points li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  width: 8px;
+  height: 1px;
+  background: var(--tech);
+}
+
+.overview-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.metric-card {
+  background: var(--surface);
+  padding: 26px 24px;
+}
+
+.metric-card h4 {
+  font-size: 15px;
+  margin-bottom: 8px;
+}
+
+.metric-card p {
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+@media (max-width: 860px) {
+  .overview-grid { grid-template-columns: 1fr; }
+}

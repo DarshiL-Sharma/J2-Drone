@@ -1,0 +1,49 @@
+.reverse-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 0.8fr;
+  gap: 60px;
+}
+
+.reverse-copy .section-title { margin: 14px 0 18px; }
+
+.reverse-steps {
+  margin: 30px 0 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  color: var(--text-dim);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+
+.reverse-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 36px 20px;
+}
+
+.reverse-node {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 13px 22px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.reverse-arrow {
+  color: var(--text-dim);
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+@media (max-width: 860px) {
+  .reverse-grid { grid-template-columns: 1fr; }
+}

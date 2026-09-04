@@ -1,0 +1,80 @@
+.sim-frame {
+  position: relative;
+  height: 560px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg-2);
+}
+
+.sim-frame canvas { height: 100% !important; }
+
+.sim-badge {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  color: var(--live);
+  border: 1px solid var(--live);
+  padding: 4px 9px;
+  border-radius: 2px;
+  background: rgba(5, 5, 5, 0.6);
+}
+
+.sim-hud {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  gap: 8px;
+  background: rgba(5, 5, 5, 0.55);
+  border: 1px solid var(--border);
+  padding: 14px 16px;
+  border-radius: 3px;
+  backdrop-filter: blur(6px);
+  min-width: 168px;
+}
+
+.sim-hud div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.sim-hud span { color: var(--text-dim); }
+.sim-hud strong { color: var(--text); font-weight: 500; }
+
+.sim-controls {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.sim-controls button {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 10px 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-dim);
+  border-radius: 3px;
+  transition: all 0.15s ease;
+}
+
+.sim-controls button:hover { color: var(--text); }
+
+.sim-controls button.is-active {
+  background: var(--text);
+  color: var(--bg);
+  border-color: var(--text);
+}
+
+@media (max-width: 720px) {
+  .sim-frame { height: 420px; }
+  .sim-hud { min-width: 140px; padding: 10px 12px; }
+}

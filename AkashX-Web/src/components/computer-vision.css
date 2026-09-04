@@ -1,0 +1,107 @@
+.vision-grid {
+  display: grid;
+  grid-template-columns: 0.85fr 1.15fr;
+  gap: 52px;
+  align-items: center;
+}
+
+.vision-copy .section-title { margin: 14px 0 18px; }
+
+.vision-tech {
+  display: flex;
+  gap: 10px;
+  margin-top: 26px;
+  flex-wrap: wrap;
+}
+
+.vision-tech span {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  padding: 6px 11px;
+  border-radius: 2px;
+}
+
+.vision-toggle {
+  display: flex;
+  gap: 10px;
+  margin-top: 28px;
+}
+
+.vision-toggle button {
+  font-size: 13px;
+  padding: 10px 18px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 3px;
+}
+
+.vision-toggle button.is-active {
+  background: var(--text);
+  color: var(--bg);
+  border-color: var(--text);
+}
+
+.vision-feed {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: #0a0c0e;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.vision-terrain {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, #14171a 0%, #0a0c0e 70%),
+    repeating-linear-gradient(120deg, rgba(191,197,204,0.05) 0px, rgba(191,197,204,0.05) 1px, transparent 1px, transparent 46px);
+}
+
+.vision-feed.is-thermal .vision-terrain {
+  background:
+    linear-gradient(180deg, #241209 0%, #0d0704 70%),
+    repeating-linear-gradient(120deg, rgba(201,161,90,0.08) 0px, rgba(201,161,90,0.08) 1px, transparent 1px, transparent 46px);
+}
+
+.vision-badge {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 2;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--live);
+  border: 1px solid var(--live);
+  padding: 4px 9px;
+  border-radius: 2px;
+  background: rgba(5, 5, 5, 0.6);
+}
+
+.vision-box {
+  position: absolute;
+  border: 1.5px solid #F5F5F5;
+  z-index: 1;
+}
+
+.vision-feed.is-thermal .vision-box { border-color: #C9A15A; }
+
+.vision-box span {
+  position: absolute;
+  top: -20px;
+  left: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  background: var(--text);
+  color: var(--bg);
+  padding: 2px 6px;
+}
+
+.vision-feed.is-thermal .vision-box span { background: #C9A15A; color: #0a0c0e; }
+
+@media (max-width: 860px) {
+  .vision-grid { grid-template-columns: 1fr; }
+}

@@ -1,0 +1,31 @@
+.tech-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 48px;
+}
+
+.tech-col-label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 16px;
+}
+
+.tech-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tech-chips span {
+  border: 1px solid var(--border);
+  padding: 9px 15px;
+  border-radius: 3px;
+  font-size: 13.5px;
+  color: var(--text);
+  background: var(--surface);
+}
+
+@media (max-width: 700px) {
+  .tech-columns { grid-template-columns: 1fr; gap: 32px; }
+}

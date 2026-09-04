@@ -1,0 +1,71 @@
+.arch-diagram {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 40px;
+  align-items: start;
+}
+
+.arch-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.arch-row {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.arch-node {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 15px 26px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  text-align: center;
+}
+
+.arch-node.small { font-size: 12px; padding: 11px 18px; color: var(--text-dim); }
+
+.arch-node.accent {
+  border-color: var(--tech);
+  color: var(--text);
+}
+
+.arch-node.ghost {
+  border-style: dashed;
+  color: var(--text-dim);
+}
+
+.arch-connector {
+  width: 1px;
+  height: 26px;
+  background: var(--border);
+}
+
+.arch-connector.short { height: 18px; }
+
+.arch-side {
+  display: flex;
+  flex-direction: column;
+  gap: 34px;
+  padding-top: 8px;
+}
+
+.arch-branch {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-left: 1px dashed var(--border);
+  padding-left: 20px;
+}
+
+@media (max-width: 860px) {
+  .arch-diagram { grid-template-columns: 1fr; }
+  .arch-node { padding: 12px 16px; font-size: 12px; }
+}
