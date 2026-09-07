@@ -38,7 +38,7 @@ def draw_fire_smoke_boxes(annotated, fire_results, conf_threshold):
                 is_smoke = True
                 color = (0, 165, 255)
             else:
-                color = (0, 255, 255)
+                continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(0, y1 - 6)),
@@ -52,6 +52,18 @@ def list_victim_captures(limit=None):
     try:
         files = [
             os.path.join(VICTIM_DIR, f) for f in os.listdir(VICTIM_DIR)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ]
+    except FileNotFoundError:
+        return []
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[:limit] if limit else files
+
+
+def list_fire_captures(limit=None):
+    try:
+        files = [
+            os.path.join(FIRE_DIR, f) for f in os.listdir(FIRE_DIR)
             if f.lower().endswith((".jpg", ".jpeg", ".png"))
         ]
     except FileNotFoundError:

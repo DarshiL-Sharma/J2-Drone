@@ -1,6 +1,4 @@
 # This system can only be used when the sensors are there 😗😗 (Try Dead reckoning system)
-
-
 import math
 import time
 

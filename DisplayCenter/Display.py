@@ -1,3 +1,4 @@
+
 from ConstantsCenter.constants import (
     VIDEO_DISPLAY_SIZE,
     VIDEO_REFRESH_MS,
@@ -14,8 +15,19 @@ from ConstantsCenter.constants import (
     GALLERY_MAX_STRIP_THUMBS,
     GALLERY_REFRESH_MS,
     FULL_VIEW_MAX_SIZE,
+    SOS_REFRESH_MS,
+    SOS_THUMB_SIZE,
+    BASE_LAT,             # ADDED: base/takeoff GPS position, used to center the map on start
+    BASE_LNG,              # ADDED
+    MAP_DEFAULT_ZOOM,      # ADDED: starting zoom for the SOS map widget
+    SOS_COLOR_IDLE,        # ADDED
+    SOS_COLOR_ENROUTE,     # ADDED
+    SOS_COLOR_LANDED,      # ADDED
+    SOS_COLOR_ERROR,       # ADDED
 )
-from CommunicationCenter.communication import list_victim_captures
+from CommunicationCenter.communication import list_victim_captures, list_fire_captures
+from CommunicationCenter.sos_store import list_sos_reports
+from CloudCenter.sosListener import SOSListener  # ADDED: live cloud SOS auto-dispatch
 
 from CommandsCenter.Commands import Drone
 from CommunicationCenter.Streaming import VideoStream
@@ -23,6 +35,7 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import font as tkfont
+import math  # ADDED: bearing calc for the SOS path arrow
 import os
 try:
     import cv2
@@ -32,15 +45,38 @@ try:
     VIDEO_AVAILABLE = True
 except ImportError:
     VIDEO_AVAILABLE = False
+
+# ADDED: optional map widget — mirrors the VIDEO_AVAILABLE guard pattern so a
+# missing/broken tkintermapview install can never break the rest of the UI.
+try:
+    from tkintermapview import TkinterMapView
+    MAP_AVAILABLE = True
+except ImportError:
+    MAP_AVAILABLE = False
+
+# ---- palette (visual style only - no functional meaning) ----
+BG = "#14151b"
+PANEL_BG = "#1b1d26"
+CARD_BG = "#20222c"
+BORDER = "#2c2f3d"
+ACCENT = "#8fd6ff"
+GREEN = "#5be36a"
+RED = "#ff5555"
+AMBER = "#ffb347"
+MUTED = "#777f8f"
+TEXT = "#e8e9ee"
+
+
 class DroneApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Drone Control")
-        self.geometry("1040x620")
-        self.configure(bg="#1e1f26")
+        self.geometry("1320x800")
+        self.minsize(1080, 620)
+        self.configure(bg=BG)
 
         self.drone = Drone()
-        self.video = None  # set below, but must exist before _refresh_gallery_strip()
+        self.video = None  # set below, but must exist before _refresh_galleries()
                             # (called from _build_ui path) checks it
         self.pressed = set()
         self._release_timers = {}
@@ -48,8 +84,20 @@ class DroneApp(tk.Tk):
         self.kill_armed_guard = False
         self.quit_armed_guard = False
 
+        # ADDED: keeps handles to the latest SOS marker/path/arrow so we
+        # move/replace them instead of stacking overlays on the map
+        self.sos_marker = None
+        self.sos_path = None
+        self.sos_arrow_marker = None
+
         self.action_queue = queue.Queue()
         threading.Thread(target=self._worker_loop, daemon=True).start()
+
+        # ADDED: SOS auto-dispatch listener — watches Firestore sos_alerts
+        # and queues a full auto takeoff -> fly -> land cycle on the same
+        # worker thread/queue used by T/L/C, so it can never race a manual key.
+        self.sos_listener = SOSListener(on_sos_active=self._on_sos_event)
+        self.sos_listener.start()
 
         self._move_key_labels = {
             "w": "forward", "s": "backward",
@@ -60,7 +108,8 @@ class DroneApp(tk.Tk):
         self._last_active_move_keys = frozenset()
 
         self._build_ui()
-        self._refresh_gallery_strip()
+        self._refresh_galleries()
+        self._refresh_sos()
 
         if VIDEO_AVAILABLE:
             self.video = VideoStream()
@@ -76,136 +125,416 @@ class DroneApp(tk.Tk):
 
         self._loop()
 
+    # ================= UI BUILD =================
+
     def _build_ui(self):
-        big = tkfont.Font(size=14, weight="bold")
-        mono = tkfont.Font(family="Courier", size=11)
+        big = tkfont.Font(size=16, weight="bold")
+        section = tkfont.Font(size=11, weight="bold")
+        mono = tkfont.Font(family="Consolas", size=9)
+        mono_bold = tkfont.Font(family="Consolas", size=9, weight="bold")
+        self._fonts = dict(big=big, section=section, mono=mono, mono_bold=mono_bold)
 
-        header = tk.Label(self, text="DRONE CONTROL", font=big, fg="#ffffff", bg="#1e1f26")
-        header.pack(pady=(12, 4))
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=16, pady=(12, 6))
+        tk.Label(header, text="DRONE GROUND CONTROL", font=big, fg="#ffffff", bg=BG).pack(side="left")
 
-        body = tk.Frame(self, bg="#1e1f26")
-        body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
-        left = tk.Frame(body, bg="#1e1f26")
-        left.pack(side="left", fill="both", expand=False, padx=(0, 12))
+        left_inner = self._build_scrollable_left(body)
+        right = tk.Frame(body, bg=PANEL_BG, width=320)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
 
-        tk.Label(left, text="CAMERA", font=big, fg="#ffffff", bg="#1e1f26").pack(anchor="w")
+        self._build_left(left_inner, mono, mono_bold, section)
+        self._build_right(right, mono, mono_bold, section)
+
+    def _build_scrollable_left(self, body):
+        """Wraps the left column in a Canvas+Scrollbar so nothing (log, SOS
+        panel, map, etc.) ever silently gets clipped off the bottom on a shorter
+        screen - the operator can just scroll to reach it instead."""
+        container = tk.Frame(body, bg=BG)
+        container.pack(side="left", fill="both", expand=True, padx=(0, 12))
+
+        canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG)
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _wheel_up(event):
+            canvas.yview_scroll(-3, "units")
+
+        def _wheel_down(event):
+            canvas.yview_scroll(3, "units")
+
+        def _bind_wheel(_event):
+            canvas.bind_all("<MouseWheel>", _wheel)
+            canvas.bind_all("<Button-4>", _wheel_up)
+            canvas.bind_all("<Button-5>", _wheel_down)
+
+        def _unbind_wheel(_event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        return inner
+
+    # ---------- left column: video, alerts, galleries, map, log + sos ----------
+
+    def _build_left(self, left, mono, mono_bold, section):
         w, h = VIDEO_DISPLAY_SIZE
         video_frame = tk.Frame(left, bg="#000000", width=w, height=h)
         video_frame.pack_propagate(False)
-        video_frame.pack()
+        video_frame.pack(fill="x")
         self.video_label = tk.Label(video_frame, text="Starting camera...", bg="#000000",
-                                     fg="#888888", wraplength=w - 20, justify="center")
+                                     fg="#888888", justify="center")
         self.video_label.pack(fill="both", expand=True)
 
-        self.camera_dir_var = tk.StringVar(value="Camera: forward")
-        tk.Label(left, textvariable=self.camera_dir_var, font=mono, fg="#8fd6ff",
-                 bg="#1e1f26").pack(anchor="w", pady=(4, 0))
+        # ---- camera status + fire/smoke alert row ----
+        status_row = tk.Frame(left, bg=BG)
+        status_row.pack(fill="x", pady=(8, 10))
 
-        self.fire_status_var = tk.StringVar(value="Fire: clear")
-        self.fire_status_label = tk.Label(left, textvariable=self.fire_status_var, font=mono,
-                                           fg="#7CFC00", bg="#1e1f26")
-        self.fire_status_label.pack(anchor="w", pady=(2, 0))
+        cam_card = tk.Frame(status_row, bg=CARD_BG, padx=12, pady=8,
+                             highlightthickness=1, highlightbackground=BORDER)
+        cam_card.pack(side="left", fill="both", padx=(0, 8))
+        tk.Label(cam_card, text="CAMERA", font=("Segoe UI", 8, "bold"),
+                 fg=MUTED, bg=CARD_BG).pack(anchor="w")
+        self.camera_dir_var = tk.StringVar(value="Forward")
+        tk.Label(cam_card, textvariable=self.camera_dir_var, font=mono_bold,
+                 fg=ACCENT, bg=CARD_BG).pack(anchor="w")
 
-        self.smoke_status_var = tk.StringVar(value="Smoke: clear")
-        self.smoke_status_label = tk.Label(left, textvariable=self.smoke_status_var, font=mono,
-                                            fg="#7CFC00", bg="#1e1f26")
-        self.smoke_status_label.pack(anchor="w", pady=(2, 0))
+        self.alert_card = tk.Frame(status_row, bg=CARD_BG, padx=12, pady=8,
+                                    highlightthickness=2, highlightbackground=BORDER)
+        self.alert_card.pack(side="left", fill="both", expand=True)
+        tk.Label(self.alert_card, text="FIRE / SMOKE MONITOR", font=("Segoe UI", 8, "bold"),
+                 fg=MUTED, bg=CARD_BG).pack(anchor="w")
+        alert_row = tk.Frame(self.alert_card, bg=CARD_BG)
+        alert_row.pack(anchor="w", fill="x", pady=(2, 0))
+        self.fire_status_var = tk.StringVar(value="\U0001F7E2 FIRE CLEAR")
+        self.fire_status_label = tk.Label(alert_row, textvariable=self.fire_status_var,
+                                           font=mono_bold, fg=GREEN, bg=CARD_BG)
+        self.fire_status_label.pack(side="left", padx=(0, 18))
+        self.smoke_status_var = tk.StringVar(value="\U0001F7E2 SMOKE CLEAR")
+        self.smoke_status_label = tk.Label(alert_row, textvariable=self.smoke_status_var,
+                                            font=mono_bold, fg=GREEN, bg=CARD_BG)
+        self.smoke_status_label.pack(side="left")
 
-        # ---- victim capture gallery ----
-        gallery_header = tk.Frame(left, bg="#1e1f26")
-        gallery_header.pack(fill="x", pady=(14, 4))
-        tk.Label(gallery_header, text="VICTIM CAPTURES", font=big, fg="#ffffff",
-                 bg="#1e1f26").pack(side="left")
+        # ---- captures row: victim + fire/smoke galleries side by side ----
+        captures_row = tk.Frame(left, bg=BG)
+        captures_row.pack(fill="x", pady=(0, 8))
+
+        victim_col = tk.Frame(captures_row, bg=BG)
+        victim_col.pack(side="left", fill="both", expand=True, padx=(0, 6))
         self.victim_count_var = tk.StringVar(value="(0)")
-        tk.Label(gallery_header, textvariable=self.victim_count_var, font=mono,
-                 fg="#ffb347", bg="#1e1f26").pack(side="left", padx=(6, 0))
+        self.gallery_strip = self._build_gallery_section(
+            victim_col, "VICTIM CAPTURES", self.victim_count_var,
+            lambda: self._open_full_gallery("All Victim Captures", list_victim_captures),
+            section, mono,
+        )
+        self._gallery_thumb_widgets = []
+
+        fire_col = tk.Frame(captures_row, bg=BG)
+        fire_col.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.fire_count_var = tk.StringVar(value="(0)")
+        self.fire_gallery_strip = self._build_gallery_section(
+            fire_col, "FIRE & SMOKE CAPTURES", self.fire_count_var,
+            lambda: self._open_full_gallery("All Fire & Smoke Captures", list_fire_captures),
+            section, mono, accent=AMBER,
+        )
+        self._fire_thumb_widgets = []
+
+        # ---- ADDED: live SOS map card ----
+        self._build_sos_map_section(left, mono, mono_bold, section)
+
+        # ---- bottom row: compact log + SOS alerts, side by side ----
+        bottom_row = tk.Frame(left, bg=BG, height=190)
+        bottom_row.pack(fill="both", expand=True, pady=(4, 4))
+        bottom_row.pack_propagate(False)
+
+        log_frame = tk.LabelFrame(bottom_row, text="Log", bg=BG, fg=MUTED,
+                                   labelanchor="nw", bd=1, highlightbackground=BORDER)
+        log_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.log_box = tk.Listbox(log_frame, bg="#111218", fg="#7CFC00", font=mono,
+                                   highlightthickness=0, borderwidth=0)
+        self.log_box.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self._build_sos_section(bottom_row, mono, mono_bold, section)
+
+    def _build_gallery_section(self, parent, title, count_var, view_all_cmd, section, mono, accent=AMBER):
+        header = tk.Frame(parent, bg=BG)
+        header.pack(fill="x", pady=(2, 4))
+        tk.Label(header, text=title, font=section, fg="#ffffff", bg=BG).pack(side="left")
+        tk.Label(header, textvariable=count_var, font=mono, fg=accent, bg=BG).pack(side="left", padx=(6, 0))
 
         thumb_h = GALLERY_THUMB_SIZE[1] if isinstance(GALLERY_THUMB_SIZE, (tuple, list)) else 80
-        strip_container = tk.Frame(left, bg="#1e1f26")
-        strip_container.pack(fill="x", pady=(0, 4))
-        self.gallery_canvas = tk.Canvas(strip_container, bg="#1e1f26",
-                                         height=thumb_h + 10, highlightthickness=0)
-        gallery_scrollbar = tk.Scrollbar(strip_container, orient="horizontal",
-                                          command=self.gallery_canvas.xview)
-        self.gallery_strip = tk.Frame(self.gallery_canvas, bg="#1e1f26")
-        self.gallery_strip.bind(
-            "<Configure>",
-            lambda e: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
-        )
-        self.gallery_canvas.create_window((0, 0), window=self.gallery_strip, anchor="nw")
-        self.gallery_canvas.configure(xscrollcommand=gallery_scrollbar.set)
-        self.gallery_canvas.pack(side="top", fill="x")
-        gallery_scrollbar.pack(side="top", fill="x")
-        self._gallery_thumb_widgets = []  # keeps widget + PhotoImage refs alive
+        strip_container = tk.Frame(parent, bg=BG)
+        strip_container.pack(fill="x")
+        canvas = tk.Canvas(strip_container, bg=BG, height=thumb_h + 10, highlightthickness=0)
+        scrollbar = tk.Scrollbar(strip_container, orient="horizontal", command=canvas.xview)
+        strip = tk.Frame(canvas, bg=BG)
+        strip.bind("<Configure>", lambda e, c=canvas: c.configure(scrollregion=c.bbox("all")))
+        canvas.create_window((0, 0), window=strip, anchor="nw")
+        canvas.configure(xscrollcommand=scrollbar.set)
+        canvas.pack(side="top", fill="x")
+        scrollbar.pack(side="top", fill="x")
 
-        tk.Button(left, text="View All Captures", command=self._open_gallery_window,
+        tk.Button(parent, text="View All Captures", command=view_all_cmd,
                   bg="#33475b", fg="white", activebackground="#3d5871", relief="flat",
-                  font=mono).pack(fill="x", pady=(2, 0))
+                  font=mono).pack(fill="x", pady=(2, 10))
+        return strip
 
-        right = tk.Frame(body, bg="#1e1f26")
-        right.pack(side="left", fill="both", expand=True)
+    def _build_sos_map_section(self, parent, mono, mono_bold, section):
+        """ADDED: live cloud SOS map card. Shows the base/takeoff point on load,
+        then drops/moves a marker + path/bearing arrow the instant SOSListener
+        fires, so the operator can see exactly where the drone is heading."""
+        map_card = tk.Frame(parent, bg=CARD_BG, padx=12, pady=10,
+                             highlightthickness=1, highlightbackground=BORDER)
+        map_card.pack(fill="x", pady=(0, 8))
+
+        header = tk.Frame(map_card, bg=CARD_BG)
+        header.pack(fill="x", pady=(0, 6))
+        tk.Label(header, text="SOS MAP", font=section, fg="#ffffff", bg=CARD_BG).pack(side="left")
+        self.sos_status_var = tk.StringVar(value="SOS: idle")
+        self.sos_status_label = tk.Label(header, textvariable=self.sos_status_var,
+                                          font=mono_bold, fg=SOS_COLOR_IDLE, bg=CARD_BG)
+        self.sos_status_label.pack(side="right")
+
+        map_container = tk.Frame(map_card, bg="#000000", height=220)
+        map_container.pack(fill="x")
+        map_container.pack_propagate(False)
+
+        if MAP_AVAILABLE:
+            self.map_widget = TkinterMapView(map_container, corner_radius=0)
+            self.map_widget.pack(fill="both", expand=True)
+            self.map_widget.set_position(BASE_LAT, BASE_LNG)
+            self.map_widget.set_zoom(MAP_DEFAULT_ZOOM)
+            self.base_marker = self.map_widget.set_marker(
+                BASE_LAT, BASE_LNG, text="Base", marker_color_circle=ACCENT,
+                marker_color_outside="#33475b"
+            )
+        else:
+            self.map_widget = None
+            tk.Label(map_container, text="Map disabled.\npip install tkintermapview",
+                     bg="#000000", fg="#888888", justify="center").pack(fill="both", expand=True)
+
+    def _build_sos_section(self, parent, mono, mono_bold, section):
+        sos_frame = tk.LabelFrame(parent, text="SOS Alerts", bg=BG, fg=RED,
+                                   labelanchor="nw", bd=1, highlightbackground=BORDER)
+        sos_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        header = tk.Frame(sos_frame, bg=BG)
+        header.pack(fill="x", padx=4, pady=(0, 2))
+        self.sos_count_var = tk.StringVar(value="(0)")
+        tk.Label(header, textvariable=self.sos_count_var, font=mono, fg=RED, bg=BG).pack(side="left")
+
+        list_container = tk.Frame(sos_frame, bg=BG)
+        list_container.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        canvas = tk.Canvas(list_container, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        self.sos_list_frame = tk.Frame(canvas, bg=BG)
+        self.sos_list_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.sos_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self._sos_card_widgets = []
+
+    # ---------- right column: keyboard controls + status ----------
+
+    def _build_right(self, right, mono, mono_bold, section):
+        tk.Label(right, text="KEYBOARD CONTROLS", font=section, fg="#ffffff",
+                 bg=PANEL_BG).pack(anchor="w", padx=14, pady=(16, 8))
+
+        controls_frame = tk.Frame(right, bg=PANEL_BG)
+        controls_frame.pack(fill="x", padx=14)
+        controls = [
+            ("T", "Takeoff"),
+            ("L", "Land"),
+            ("C", "Toggle camera direction"),
+            ("R", "Start / stop recording"),
+            ("P", "Capture photo"),
+            ("W / S", "Forward / Backward"),
+            ("A / D", "Roll left / Roll right"),
+            ("UP / DOWN", "Throttle + / \u2212"),
+            ("LEFT / RIGHT", "Camera pan"),
+        ]
+        for key_text, desc in controls:
+            self._control_row(controls_frame, key_text, desc, mono, mono_bold)
+
+        self._separator(right)
+
+        tk.Label(right, text="SAFETY", font=section, fg="#ffffff",
+                 bg=PANEL_BG).pack(anchor="w", padx=14, pady=(0, 8))
+        safety_frame = tk.Frame(right, bg=PANEL_BG)
+        safety_frame.pack(fill="x", padx=14)
+        self._control_row(safety_frame, "K + I", "EMERGENCY STOP", mono, mono_bold,
+                           key_bg="#5a1f1f", key_fg="#ff9a9a", desc_fg="#ff9a9a")
+        self._control_row(safety_frame, "Q + I", "Quit (kills first)", mono, mono_bold,
+                           key_bg="#5a4318", key_fg="#ffcf80", desc_fg="#ffcf80")
+
+        self._separator(right)
+
+        tk.Label(right, text="STATUS", font=section, fg="#ffffff",
+                 bg=PANEL_BG).pack(anchor="w", padx=14, pady=(0, 8))
+        status_card = tk.Frame(right, bg=CARD_BG, padx=12, pady=10,
+                                highlightthickness=1, highlightbackground=BORDER)
+        status_card.pack(fill="x", padx=14)
 
         self.status_var = tk.StringVar(value="DISARMED")
-        self.status_label = tk.Label(right, textvariable=self.status_var, font=big,
-                                      fg="#ff5555", bg="#1e1f26")
-        self.status_label.pack(pady=4)
-
-        telem = tk.Frame(right, bg="#2b2d38", padx=12, pady=8)
-        telem.pack(pady=8, fill="x")
-        self.telem_var = tk.StringVar(value="roll=0x80 pitch=0x80 throttle=0x80 yaw=0x80")
-        tk.Label(telem, textvariable=self.telem_var, font=mono, fg="#8fd6ff", bg="#2b2d38").pack()
+        self.status_label = tk.Label(status_card, textvariable=self.status_var,
+                                      font=("Segoe UI", 13, "bold"), fg=RED, bg=CARD_BG)
+        self.status_label.pack(anchor="w")
 
         self.action_var = tk.StringVar(value="Ready. Click this window, then fly.")
-        tk.Label(right, textvariable=self.action_var, font=mono, fg="#cccccc", bg="#1e1f26",
-                 wraplength=420, justify="left").pack(pady=6, anchor="w")
+        tk.Label(status_card, textvariable=self.action_var, font=mono, fg="#cccccc", bg=CARD_BG,
+                 wraplength=270, justify="left").pack(anchor="w", pady=(6, 6))
 
-        help_text = (
-            "T = takeoff        L = land (EXPERIMENTAL, 10s)   C = toggle camera dir\n"
-            "R = start/stop video record   P = photo save\n"
-            "W/S = forward/back     A/D = roll (tested/opposite)\n"
-            "Up/Down = throttle      Left/Right = camera pan\n\n"
-            "Hold K + I together = EMERGENCY STOP\n"
-            "Hold Q + I together = QUIT (kills first)\n\n"
-            f"Victim captures auto-save (max once every {VICTIM_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
-            "when a person is detected - see gallery, top-left.\n"
-            f"Fire captures auto-save (max once every {FIRE_SAVE_COOLDOWN_SECONDS:.0f}s)\n"
-            "to output/fire when the orange/red heat signature is seen."
-        )
-        tk.Label(right, text=help_text, font=mono, fg="#888888", bg="#1e1f26",
-                 justify="left").pack(pady=10, anchor="w")
+        self.telem_var = tk.StringVar(value="roll=0x80 pitch=0x80 throttle=0x80 yaw=0x80")
+        tk.Label(status_card, textvariable=self.telem_var, font=mono, fg=ACCENT, bg=CARD_BG,
+                 justify="left", wraplength=270).pack(anchor="w")
 
-        self.log_box = tk.Listbox(right, height=8, bg="#111218", fg="#7CFC00", font=mono,
-                                   highlightthickness=0, borderwidth=0)
-        self.log_box.pack(fill="both", expand=True, pady=(4, 0))
+        tk.Label(
+            right,
+            text=(
+                f"Victim captures autosave every {VICTIM_SAVE_COOLDOWN_SECONDS:.0f}s max.\n"
+                f"Fire/smoke captures autosave every {FIRE_SAVE_COOLDOWN_SECONDS:.0f}s max.\n"
+                f"SOS alerts from the cloud auto-dispatch the drone."
+            ),
+            font=("Segoe UI", 8), fg=MUTED, bg=PANEL_BG, justify="left",
+        ).pack(anchor="w", padx=14, pady=(12, 0))
+
+    def _control_row(self, parent, key_text, desc_text, mono, mono_bold,
+                      key_bg="#2c3e50", key_fg="white", desc_fg="#cccccc"):
+        row = tk.Frame(parent, bg=PANEL_BG)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=key_text, font=mono_bold, fg=key_fg, bg=key_bg,
+                 padx=8, pady=3, width=11, anchor="center").pack(side="left")
+        tk.Label(row, text=desc_text, font=mono, fg=desc_fg, bg=PANEL_BG,
+                 anchor="w").pack(side="left", padx=(8, 0), fill="x", expand=True)
+        return row
+
+    def _separator(self, parent):
+        sep = tk.Frame(parent, bg=BORDER, height=1)
+        sep.pack(fill="x", padx=14, pady=10)
+
+    # ================= LOG =================
 
     def _log(self, msg):
         self.log_box.insert(tk.END, msg)
         self.log_box.yview_moveto(1.0)
 
-    #victim gallery
-    def _refresh_gallery_strip(self):
-        """Re-reads the victims folder and redraws the inline thumbnail strip.
-        Runs on its own timer, fully decoupled from the video/flight loops -
-        a stalled camera or a missing PIL install can never affect flying."""
-        all_paths = list_victim_captures()
-        self.victim_count_var.set(f"({len(all_paths)})")
+    # ================= SOS MAP (live cloud) =================
 
-        for w in self._gallery_thumb_widgets:
+    def _update_sos_marker(self, lat, lng, label):
+        """ADDED: places/moves the SOS marker on the map and recenters on it."""
+        if self.map_widget is None:
+            return
+        if self.sos_marker is not None:
+            self.sos_marker.delete()
+        self.sos_marker = self.map_widget.set_marker(
+            lat, lng, text=label or "SOS",
+            marker_color_circle=RED, marker_color_outside=AMBER
+        )
+        self.map_widget.set_position(lat, lng)
+
+    def _compute_bearing(self, lat1, lng1, lat2, lng2):
+        """True bearing (0-360, 0=N, clockwise) from (lat1,lng1) to (lat2,lng2) —
+        same great-circle convention as geoConvert.latlng_to_north_east, just
+        expressed as a compass heading for the on-map label."""
+        lat1r, lat2r = math.radians(lat1), math.radians(lat2)
+        dlng = math.radians(lng2 - lng1)
+        x = math.sin(dlng) * math.cos(lat2r)
+        y = math.cos(lat1r) * math.sin(lat2r) - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlng)
+        return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+    def _update_sos_path(self, lat, lng):
+        """ADDED: draws the base -> SOS trajectory the instant a dispatch starts
+        (called from _on_sos_event, same as _update_sos_marker), so the direction
+        is visible immediately rather than only once the drone lands."""
+        if self.map_widget is None:
+            return
+        if self.sos_path is not None:
+            self.sos_path.delete()
+        self.sos_path = self.map_widget.set_path(
+            [(BASE_LAT, BASE_LNG), (lat, lng)],
+            color=SOS_COLOR_ENROUTE, width=4
+        )
+        bearing = self._compute_bearing(BASE_LAT, BASE_LNG, lat, lng)
+        mid_lat, mid_lng = (BASE_LAT + lat) / 2, (BASE_LNG + lng) / 2
+        if self.sos_arrow_marker is not None:
+            self.sos_arrow_marker.delete()
+        self.sos_arrow_marker = self.map_widget.set_marker(
+            mid_lat, mid_lng, text=f"\u2192 {bearing:.0f}\u00b0",
+            marker_color_circle=SOS_COLOR_ENROUTE, marker_color_outside=SOS_COLOR_ENROUTE
+        )
+
+    def _on_sos_event(self, sos_id, lat, lng, message):
+        """ADDED: fired from SOSListener's Firestore thread — never touch Tkinter
+        widgets here directly, hop to the main thread via self.after."""
+        def go():
+            label = message or sos_id
+            self.sos_status_var.set(f"SOS: dispatching -> {label}")
+            self.sos_status_label.config(fg=SOS_COLOR_ENROUTE)
+            self._update_sos_marker(lat, lng, label)
+            self._update_sos_path(lat, lng)
+            self._enqueue(
+                f"SOS dispatch: {label} ({lat:.5f},{lng:.5f})",
+                lambda: self.drone.dispatch_to_sos(lat, lng, message),
+                done_msg=f"SOS dispatch complete - landed ({label}).",
+            )
+        self.after(0, go)
+
+    # ================= GALLERIES + FIRE/SMOKE ALERT =================
+
+    def _refresh_galleries(self):
+        """Re-reads the victims and fire/smoke folders and redraws both thumbnail
+        strips, then refreshes the fire/smoke alert card. Runs on its own timer,
+        fully decoupled from the video/flight loops - a stalled camera or a
+        missing PIL install can never affect flying."""
+        victim_paths = list_victim_captures()
+        self._refresh_thumb_strip(self.gallery_strip, self._gallery_thumb_widgets,
+                                   victim_paths, self.victim_count_var)
+
+        fire_paths = list_fire_captures()
+        self._refresh_thumb_strip(self.fire_gallery_strip, self._fire_thumb_widgets,
+                                   fire_paths, self.fire_count_var)
+
+        self._update_fire_smoke_alert()
+
+        self.after(GALLERY_REFRESH_MS, self._refresh_galleries)
+
+    def _refresh_thumb_strip(self, strip, widget_list, paths, count_var):
+        count_var.set(f"({len(paths)})")
+
+        for w in widget_list:
             w.destroy()
-        self._gallery_thumb_widgets = []
+        widget_list.clear()
 
-        recent = all_paths[:GALLERY_MAX_STRIP_THUMBS]
+        recent = paths[:GALLERY_MAX_STRIP_THUMBS]
         if not recent:
-            lbl = tk.Label(self.gallery_strip, text="No captures yet", fg="#666666",
-                            bg="#1e1f26", font=("Courier", 9))
+            lbl = tk.Label(strip, text="No captures yet", fg="#666666",
+                            bg=BG, font=("Courier", 9))
             lbl.pack(side="left")
-            self._gallery_thumb_widgets.append(lbl)
+            widget_list.append(lbl)
         elif not VIDEO_AVAILABLE:
-            lbl = tk.Label(self.gallery_strip, text=f"{len(recent)} saved (install pillow to preview)",
-                            fg="#666666", bg="#1e1f26", font=("Courier", 9))
+            lbl = tk.Label(strip, text=f"{len(recent)} saved (install pillow to preview)",
+                            fg="#666666", bg=BG, font=("Courier", 9))
             lbl.pack(side="left")
-            self._gallery_thumb_widgets.append(lbl)
+            widget_list.append(lbl)
         else:
             for path in recent:
                 try:
@@ -214,28 +543,38 @@ class DroneApp(tk.Tk):
                     photo = ImageTk.PhotoImage(img)
                 except Exception:
                     continue
-                thumb = tk.Label(self.gallery_strip, image=photo, bg="#000000", cursor="hand2")
+                thumb = tk.Label(strip, image=photo, bg="#000000", cursor="hand2")
                 thumb.image = photo  # keep a reference or Tkinter will garbage-collect it
                 thumb.pack(side="left", padx=2)
                 thumb.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
-                self._gallery_thumb_widgets.append(thumb)
+                widget_list.append(thumb)
 
-        if self.video is not None:
-            if self.video.fire_active:
-                self.fire_status_var.set("Fire: DETECTED")
-                self.fire_status_label.config(fg="#ff5555")
-            else:
-                self.fire_status_var.set("Fire: clear")
-                self.fire_status_label.config(fg="#7CFC00")
+    def _update_fire_smoke_alert(self):
+        if self.video is None:
+            return
 
-            if self.video.smoke_active:
-                self.smoke_status_var.set("Smoke: DETECTED")
-                self.smoke_status_label.config(fg="#ff5555")
-            else:
-                self.smoke_status_var.set("Smoke: clear")
-                self.smoke_status_label.config(fg="#7CFC00")
+        fire = self.video.fire_active
+        smoke = self.video.smoke_active
 
-        self.after(GALLERY_REFRESH_MS, self._refresh_gallery_strip)
+        if fire:
+            self.fire_status_var.set("\U0001F534 FIRE DETECTED")
+            self.fire_status_label.config(fg=RED)
+        else:
+            self.fire_status_var.set("\U0001F7E2 FIRE CLEAR")
+            self.fire_status_label.config(fg=GREEN)
+
+        if smoke:
+            self.smoke_status_var.set("\U0001F7E0 SMOKE DETECTED")
+            self.smoke_status_label.config(fg=AMBER)
+        else:
+            self.smoke_status_var.set("\U0001F7E2 SMOKE CLEAR")
+            self.smoke_status_label.config(fg=GREEN)
+
+        if fire or smoke:
+            border = RED if fire else AMBER
+            self.alert_card.config(bg=CARD_BG, highlightbackground=border, highlightthickness=3)
+        else:
+            self.alert_card.config(highlightbackground=BORDER, highlightthickness=2)
 
     def _show_full_image(self, path):
         """Opens one capture at a larger size in its own window."""
@@ -256,16 +595,17 @@ class DroneApp(tk.Tk):
         except Exception as e:
             tk.Label(top, text=f"Could not open image: {e}", fg="white", bg="#000000").pack(padx=20, pady=20)
 
-    def _open_gallery_window(self):
-        """Full scrollable grid of every victim capture saved so far."""
+    def _open_full_gallery(self, title, list_fn):
+        """Full scrollable grid of every capture saved so far for a given list_fn
+        (list_victim_captures or list_fire_captures)."""
         top = tk.Toplevel(self)
-        top.title("All Victim Captures")
+        top.title(title)
         top.geometry("640x480")
-        top.configure(bg="#1e1f26")
+        top.configure(bg=BG)
 
-        canvas = tk.Canvas(top, bg="#1e1f26", highlightthickness=0)
+        canvas = tk.Canvas(top, bg=BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(top, orient="vertical", command=canvas.yview)
-        grid_frame = tk.Frame(canvas, bg="#1e1f26")
+        grid_frame = tk.Frame(canvas, bg=BG)
 
         grid_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=grid_frame, anchor="nw")
@@ -273,13 +613,13 @@ class DroneApp(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        paths = list_victim_captures()
+        paths = list_fn()
         if not paths:
-            tk.Label(grid_frame, text="No captures yet.", fg="#888888", bg="#1e1f26").pack(padx=20, pady=20)
+            tk.Label(grid_frame, text="No captures yet.", fg="#888888", bg=BG).pack(padx=20, pady=20)
             return
         if not VIDEO_AVAILABLE:
             tk.Label(grid_frame, text=f"{len(paths)} files saved - install pillow to preview them.",
-                     fg="#888888", bg="#1e1f26").pack(padx=20, pady=20)
+                     fg="#888888", bg=BG).pack(padx=20, pady=20)
             return
 
         cols = 4
@@ -292,14 +632,89 @@ class DroneApp(tk.Tk):
             except Exception:
                 continue
             thumb_refs.append(photo)
-            cell = tk.Frame(grid_frame, bg="#1e1f26")
+            cell = tk.Frame(grid_frame, bg=BG)
             cell.grid(row=i // cols, column=i % cols, padx=6, pady=6)
             lbl = tk.Label(cell, image=photo, bg="#000000", cursor="hand2")
             lbl.pack()
             lbl.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
-            tk.Label(cell, text=os.path.basename(path), fg="#888888", bg="#1e1f26",
+            tk.Label(cell, text=os.path.basename(path), fg="#888888", bg=BG,
                      font=("Courier", 7)).pack()
         top.thumb_refs = thumb_refs
+
+    # ================= SOS ALERTS (historical list) =================
+
+    def _refresh_sos(self):
+        """Polls the SOS database (see CommunicationCenter/sos_store.py) and
+        redraws the alert list. Empty until something actually starts calling
+        save_sos_report() - e.g. the mobile app / SOSListener pipeline."""
+        try:
+            reports = list_sos_reports()
+        except Exception:
+            self.sos_count_var.set("(error)")
+            self.after(SOS_REFRESH_MS, self._refresh_sos)
+            return
+
+        self.sos_count_var.set(f"({len(reports)})")
+
+        for w in self._sos_card_widgets:
+            w.destroy()
+        self._sos_card_widgets = []
+
+        if not reports:
+            lbl = tk.Label(self.sos_list_frame, text="No SOS alerts.", fg="#666666",
+                            bg=BG, font=("Courier", 9))
+            lbl.pack(anchor="w", padx=4, pady=4)
+            self._sos_card_widgets.append(lbl)
+        else:
+            for r in reports:
+                self._sos_card_widgets.append(self._build_sos_card(r))
+
+        self.after(SOS_REFRESH_MS, self._refresh_sos)
+
+    def _build_sos_card(self, report):
+        card = tk.Frame(self.sos_list_frame, bg=CARD_BG, highlightthickness=1,
+                         highlightbackground=RED, padx=6, pady=4)
+        card.pack(fill="x", padx=4, pady=3)
+
+        name = report.get("name") or "Unknown"
+        ts = report.get("created_at") or ""
+        tk.Label(card, text=f"{name}   {ts}", font=("Segoe UI", 9, "bold"),
+                 fg="#ffffff", bg=CARD_BG).pack(anchor="w")
+
+        phone = report.get("phone") or "\u2014"
+        tk.Label(card, text=f"Phone: {phone}", font=("Consolas", 8),
+                 fg="#cccccc", bg=CARD_BG).pack(anchor="w")
+
+        condition = report.get("health_condition") or "\u2014"
+        tk.Label(card, text=f"Condition: {condition}", font=("Consolas", 8),
+                 fg=AMBER, bg=CARD_BG).pack(anchor="w")
+
+        lat, lon = report.get("latitude"), report.get("longitude")
+        loc_text = (f"Location: {lat:.5f}, {lon:.5f}"
+                    if lat is not None and lon is not None else "Location: unknown")
+        tk.Label(card, text=loc_text, font=("Consolas", 8),
+                 fg=ACCENT, bg=CARD_BG).pack(anchor="w")
+
+        if VIDEO_AVAILABLE:
+            imgs_row = tk.Frame(card, bg=CARD_BG)
+            imgs_row.pack(anchor="w", pady=(4, 0))
+            for path in (report.get("front_image_path"), report.get("back_image_path")):
+                if not path or not os.path.exists(path):
+                    continue
+                try:
+                    img = Image.open(path)
+                    img.thumbnail(SOS_THUMB_SIZE)
+                    photo = ImageTk.PhotoImage(img)
+                except Exception:
+                    continue
+                thumb = tk.Label(imgs_row, image=photo, bg="#000000", cursor="hand2")
+                thumb.image = photo
+                thumb.pack(side="left", padx=2)
+                thumb.bind("<Button-1>", lambda e, p=path: self._show_full_image(p))
+
+        return card
+
+    # ================= VIDEO =================
 
     def _update_video(self):
         if self.video is None:
@@ -317,6 +732,8 @@ class DroneApp(tk.Tk):
             else:
                 self.video_label.configure(text=f"Camera: {self.video.status}", image="")
         self.after(VIDEO_REFRESH_MS, self._update_video)
+
+    # ================= KEYBOARD HANDLING =================
 
     def _on_key_press(self, event):
         key = event.keysym.lower()
@@ -392,8 +809,8 @@ class DroneApp(tk.Tk):
 
     def _do_toggle_camera(self):
         now_down = self.drone.toggle_camera_direction()
-        label = "downward" if now_down else "forward"
-        self.after(0, lambda: self.camera_dir_var.set(f"Camera: {label}"))
+        label = "Downward" if now_down else "Forward"
+        self.after(0, lambda: self.camera_dir_var.set(label))
 
     def _handle_combo_keys(self):
         both_ki = "k" in self.pressed and "i" in self.pressed
@@ -411,6 +828,8 @@ class DroneApp(tk.Tk):
         self.after(0, lambda: self.telem_var.set(
             f"waiting for failsafe... {remaining_seconds:.1f}s left (no commands being sent)"
         ))
+
+    # ================= ACTION QUEUE =================
 
     def _enqueue(self, name, fn, done_msg=""):
         self._log(f"> queued: {name}")
@@ -431,6 +850,13 @@ class DroneApp(tk.Tk):
     def _finish_action(self, done_msg):
         self.action_var.set(done_msg or "Ready.")
         self._log(f"  {done_msg}")
+        # ADDED: keep the SOS map card's status label in sync with dispatch outcomes
+        if done_msg and "SOS" in done_msg:
+            self.sos_status_var.set(f"SOS: {done_msg}")
+            if "complete" in done_msg.lower():
+                self.sos_status_label.config(fg=SOS_COLOR_LANDED)
+            else:
+                self.sos_status_label.config(fg=SOS_COLOR_ENROUTE)
         self._update_status()
 
     def _fire_kill_now(self):
@@ -450,11 +876,12 @@ class DroneApp(tk.Tk):
     def _update_status(self):
         if self.drone.armed:
             self.status_var.set("ARMED / FLYING")
-            self.status_label.config(fg="#55ff55")
+            self.status_label.config(fg=GREEN)
         else:
-            #Arpit
             self.status_var.set("DISARMED")
-            self.status_label.config(fg="#ff5555")
+            self.status_label.config(fg=RED)
+
+    # ================= FLIGHT AXES LOOP =================
 
     def _compute_axes(self):
         b2, b3, b4, b5 = CENTER, CENTER, self.drone.throttle, CENTER
@@ -487,6 +914,9 @@ class DroneApp(tk.Tk):
             if "up" in self.pressed or "down" in self.pressed:
                 self.drone.throttle = b4
             self.drone.send_axes(b2, b3, b4, b5, cmd=CMD_IDLE)
+            # ADDED: dead-reckoning altitude tracking, needed by the SOS
+            # dispatch/return-to-base logic that drives the map overlay
+            self.drone.update_altitude(b4, SEND_INTERVAL_MS / 1000.0)
             self.telem_var.set(f"roll=0x{b2:02X} pitch=0x{b3:02X} throttle=0x{b4:02X} yaw=0x{b5:02X}")
             self._log_movement_transition()
         self.after(SEND_INTERVAL_MS, self._loop)
@@ -508,6 +938,7 @@ class DroneApp(tk.Tk):
             self.drone.kill()
         except Exception:
             pass
+        self.sos_listener.stop()  # ADDED
         if self.video:
             self.video.stop()
         self.destroy()
